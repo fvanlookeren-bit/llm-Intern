@@ -8,6 +8,19 @@ import { z } from "zod";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
+
+// Ubica el CLI `lms` de LM Studio (necesario para lm_studio_load_model). Orden:
+// LMS_PATH explícito → ~/.lmstudio/bin/lms → confiar en el PATH.
+function resolveLmsBinary(): string {
+  if (process.env.LMS_PATH) return process.env.LMS_PATH;
+  const home = path.join(os.homedir(), ".lmstudio", "bin", "lms");
+  if (fs.existsSync(home)) return home;
+  return "lms";
+}
 
 const BASE_URL = process.env.LM_STUDIO_BASE_URL ?? "http://localhost:1234/v1";
 const ORIGIN = BASE_URL.replace(/\/v1\/?$/, "");
@@ -174,6 +187,93 @@ server.registerTool(
       (m) => `${m.id} [${m.state === "loaded" ? "cargado" : "no cargado"}]${m.type ? ` (${m.type})` : ""}`
     );
     return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+);
+
+server.registerTool(
+  "lm_studio_load_model",
+  {
+    title: "Cargar un modelo en LM Studio (con descarga exclusiva)",
+    description:
+      "Carga un modelo específico en LM Studio vía el CLI `lms`, opcionalmente descargando TODOS los demás " +
+      "primero (exclusive=true, default). Resuelve de raíz el problema recurrente de 'modelo equivocado " +
+      "cargado': llamá esto ANTES de una tanda de trabajo con un modelo concreto (ej. qwen3-coder-30b para " +
+      "código) para garantizar que ese, y solo ese, esté en memoria — así lm_studio_generate/lm_studio_agent " +
+      "no toman por error un modelo que quedó cargado de otra sesión. Requiere el CLI `lms` instalado " +
+      "(viene con LM Studio; se busca en LMS_PATH, ~/.lmstudio/bin/lms, o el PATH). Devuelve el estado de " +
+      "`lms ps` al terminar para que confirmes qué quedó cargado.",
+    inputSchema: {
+      model: z
+        .string()
+        .describe("ID del modelo a cargar (ver lm_studio_list_models para los IDs locales válidos)."),
+      exclusive: z
+        .boolean()
+        .optional()
+        .default(true)
+        .describe("Si true (default), descarga todos los demás modelos antes de cargar este — deja solo este en memoria."),
+      ttl: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Segundos de inactividad tras los cuales LM Studio descarga el modelo (auto-unload). Omitir = sin TTL."),
+      context_length: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Longitud de contexto a usar al cargar. Omitir = default del modelo."),
+    },
+  },
+  async ({ model, exclusive, ttl, context_length }) => {
+    // Validar el ID contra el catálogo local antes de invocar lms (mismo criterio
+    // que resolveModel para un 'model' explícito) — evita un lms load que falle o,
+    // peor, matchee parcialmente otro modelo.
+    const models = await listNativeModels();
+    const localNonEmbedding = models.filter((m) => m.type !== "embeddings");
+    if (!localNonEmbedding.some((m) => m.id === model)) {
+      const available = localNonEmbedding.map((m) => m.id).join(", ") || "(ninguno)";
+      return {
+        content: [
+          {
+            type: "text",
+            text: `El modelo '${model}' no está entre los modelos locales. Disponibles: ${available}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const lms = resolveLmsBinary();
+    const steps: string[] = [];
+    try {
+      if (exclusive) {
+        await execFileAsync(lms, ["unload", "--all"]);
+        steps.push("Descargados todos los modelos previos (unload --all).");
+      }
+      const loadArgs = ["load", model, "-y"];
+      if (ttl !== undefined) loadArgs.push("--ttl", String(ttl));
+      if (context_length !== undefined) loadArgs.push("--context-length", String(context_length));
+      await execFileAsync(lms, loadArgs, { timeout: 300000 });
+      steps.push(`Cargado '${model}'.`);
+
+      const { stdout: ps } = await execFileAsync(lms, ["ps"]);
+      return { content: [{ type: "text", text: `${steps.join("\n")}\n\nEstado actual (lms ps):\n${ps.trim()}` }] };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const hint = /ENOENT|not found/i.test(msg)
+        ? ` No se encontró el CLI 'lms'. Instalalo con LM Studio o seteá LMS_PATH al binario.`
+        : "";
+      return {
+        content: [
+          {
+            type: "text",
+            text: `${steps.join("\n")}${steps.length ? "\n" : ""}Falló al cargar '${model}': ${msg}.${hint}`,
+          },
+        ],
+        isError: true,
+      };
+    }
   }
 );
 

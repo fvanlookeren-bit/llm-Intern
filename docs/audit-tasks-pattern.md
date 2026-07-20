@@ -116,3 +116,22 @@ Pasá ese JSON Schema como `response_schema` en la llamada a `lm_studio_agent`, 
 validá `range_requested === range_used`, cruza cada `metrics[].raw_value` contra
 `tool_trace`, y tratá cualquier entrada en `tool_errors` como bloqueante para el
 diagnóstico final (no lo hagas vos con datos parciales silenciosos).
+
+## Corolario: no delegues lectura de archivos fuera del árbol de trabajo
+
+Un caso relacionado (score 1/10): se delegó a `lm_studio_agent`+filesystem "leé el
+log de uso y armá un reporte". Falló porque el archivo vivía fuera de las rutas
+autorizadas del filesystem MCP — y ampliar esas rutas para incluirlo habría expuesto
+una carpeta con secretos/credenciales al modelo local.
+
+Dos lecciones:
+
+1. **"Resumí/reportá el contenido de este archivo" es una tarea de `lm_studio_generate`,
+   no de `lm_studio_agent`.** El orquestador (que ya tiene acceso al archivo) lo lee y
+   pasa el contenido en el prompt. Sin tool loop, sin problemas de rutas, más rápido.
+   Reservá `lm_studio_agent`+filesystem para cuando el intern *tiene que descubrir*
+   qué archivos leer, no cuando vos ya sabés cuál es.
+2. **No amplíes los roots del filesystem MCP para alcanzar un archivo suelto en una
+   carpeta sensible** (`~/.claude`, `~/.ssh`, dotfiles con tokens, etc.). El costo de
+   seguridad supera la comodidad. Si el intern realmente necesita un archivo que vive
+   ahí, copiá solo ese archivo a una ruta ya autorizada antes de delegar.

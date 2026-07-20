@@ -44,9 +44,10 @@ criterio y no sea "mandarle cualquier cosa al modelo chico". Ver [`MODELS.md`](M
 
 ## Qué incluye
 
-- **`src/index.ts`** — el servidor MCP (Node/TypeScript). Cuatro tools:
+- **`src/index.ts`** — el servidor MCP (Node/TypeScript). Cinco tools:
   - `lm_studio_generate` — texto/código sin herramientas, todo el contexto va en el prompt. Soporta `response_schema` (JSON Schema) para forzar salida estructurada.
   - `lm_studio_agent` — el modelo local con acceso real a tus otros MCPs (`~/.lmstudio/mcp.json`), loop de agente completo. Devuelve `tool_trace` (qué tool se llamó, con qué args, qué devolvió) para auditar cada dato de la respuesta, y soporta `response_schema` para forzar el formato final. Ver [`docs/audit-tasks-pattern.md`](docs/audit-tasks-pattern.md) para el patrón de uso en tareas de extracción/auditoría.
+  - `lm_studio_load_model` — carga un modelo concreto con descarga exclusiva de los demás (vía el CLI `lms`). Llamalo antes de una tanda con un modelo específico para garantizar que ese, y solo ese, esté en memoria — mata de raíz el "modelo equivocado cargado".
   - `lm_studio_list_models` — qué hay descargado/cargado en LM Studio.
   - `lm_studio_list_mcp_servers` — qué MCPs puede usar `lm_studio_agent`.
 - **`.claude/skills/intern/`** — Skill de Claude Code (`/intern`) con el protocolo completo.

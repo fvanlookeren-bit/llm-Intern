@@ -26,8 +26,10 @@ dinero (a diferencia del modelo grande que sí cobra por token).
 **Regla operativa: un solo modelo cargado a la vez, siempre elegido a propósito.**
 `resolveModel()` usa lo que ya esté cargado en memoria antes que el default fijo —
 si dejás dos modelos cargados de sesiones distintas, el bridge puede terminar usando
-el equivocado sin avisar. Si vas a probar un modelo puntual, cargalo explícito (o
-pasalo por el parámetro `model`) y descargá los demás.
+el equivocado sin avisar. **Antes de una tanda con un modelo específico, llamá
+`lm_studio_load_model({ model, exclusive: true })`** — descarga todos los demás y
+deja solo ese cargado, así no hay ambigüedad. Es la forma robusta de cumplir esta
+regla (reemplaza el `lms unload`/`load` manual).
 
 ## Modelos probados
 
