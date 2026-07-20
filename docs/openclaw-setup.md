@@ -60,7 +60,7 @@ protocolo de supervisor y tiene sentido sobre todo en `main`.
 
 ## 4. Instalar el protocolo intern-first
 
-Pegá [`templates/OPENCLAW.snippet.md`](../templates/OPENCLAW.snippet.md) como una
+Pegá [`templates/openclaw.snippet.md`](../templates/openclaw.snippet.md) como una
 sección de reglas duras en el `AGENTS.md` del workspace del agente `main`.
 Reemplazá `<RUTA_DEL_REPO>`, `<TU_NOMBRE>` y `<WORKSPACE>`. Ese snippet es lo que
 invierte el default: **delegar es la regla, hacerlo directo la excepción.**

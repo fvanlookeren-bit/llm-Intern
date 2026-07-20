@@ -96,7 +96,7 @@ Una vez instalado, en cualquier sesión de Claude Code, Codex u OpenClaw:
 
 El modelo grande delega la tarea al MCP `lm-studio`, que corre local contra LM
 Studio. Con las instrucciones de `templates/CLAUDE.snippet.md` /
-`templates/AGENTS.snippet.md` / `templates/OPENCLAW.snippet.md` instaladas, la
+`templates/AGENTS.snippet.md` / `templates/openclaw.snippet.md` instaladas, la
 delegación también pasa **proactivamente** para tareas mecánicas obvias, sin que lo
 pidas cada vez.
 
@@ -140,7 +140,7 @@ Con intern:   main (pago) ─ planifica ─► intern (local, gratis) genera ─
    OpenClaw expone las tools MCP por **tool-search**, así que el `main` descubre el
    intern por nombre cuando lo necesita.
 2. Instalás el protocolo intern-first de
-   [`templates/OPENCLAW.snippet.md`](templates/OPENCLAW.snippet.md) en el `AGENTS.md`
+   [`templates/openclaw.snippet.md`](templates/openclaw.snippet.md) en el `AGENTS.md`
    del `main`. **Ojo:** no basta con pegarlo al final — hay que darle prioridad
    estructural cerca del inicio del archivo, o el modelo se ancla en sus directivas
    de arranque y sigue haciéndolo todo él mismo (ver la nota del paso 4 de la guía).
