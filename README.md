@@ -158,6 +158,7 @@ Variables de entorno opcionales (todas tienen default):
 |---|---|---|
 | `LM_STUDIO_BASE_URL` | `http://localhost:1234/v1` | Endpoint OpenAI-compatible de LM Studio |
 | `LM_STUDIO_DEFAULT_MODEL` | `qwen/qwen3.6-35b-a3b` | Modelo que se JIT-carga si no hay ninguno ya cargado |
+| `INTERN_ACTIVITY_LOG` | `~/.lmstudio/intern-activity.jsonl` | Log de actividad del intern (ver abajo). `off` lo desactiva |
 | `INTERN_MCP_CONFIG` | `~/.lmstudio/mcp.json` | Toolbox de `lm_studio_agent`. Apuntalo a un archivo curado para dar al intern un subconjunto acotado de MCPs (útil cuando lanza el bridge otro host, p.ej. OpenClaw) |
 
 ## Limitaciones conocidas (de LM Studio, no de este bridge)
@@ -166,6 +167,39 @@ Variables de entorno opcionales (todas tienen default):
   Template del modelo en la app. Ver [`docs/lm-studio-setup.md`](docs/lm-studio-setup.md#desactivar-el-thinking).
 - `lm_studio_agent` razona peor que el modelo grande sobre cuándo/cómo usar cada
   tool — verificá el resultado, no lo asumas correcto.
+
+## Ver qué está haciendo el intern
+
+En Claude Code y Codex cada tool MCP aparece con su nombre, así que ves
+`lm_studio_generate` en la UI cuando se delega. **En OpenClaw no**: con
+`toolSearch` activo (lo normal si tenés muchos MCPs), las tools se invocan a
+través de un dispatcher genérico, y en la UI todo figura como `tool_call` — el
+intern trabaja pero no se distingue del resto.
+
+Por eso el bridge escribe su propio **log de actividad**, una línea JSON por
+delegación, independiente del host:
+
+```bash
+./bin/intern-watch        # en vivo (tail -f), formateado
+./bin/intern-watch 30     # las últimas 30 y salir
+```
+
+```
+23:33:02  OK   generate       4.6s  qwen3.6-35b-a3b   Decí solo OK
+23:33:09  OK   agent          6.9s  qwen3.6-35b-a3b   [1 tool(s): filesystem__list_directory]  Listá archivos en…
+23:40:00  ERR  agent         48.2s  qwen3-coder-30b   3 tool-error(s)  sin respuesta final tras 8 iteraciones  editar 2 TSX
+```
+
+Registra tool, modelo, duración, éxito/error, qué MCP tools usó el intern y un
+recorte del prompt (160 chars — es un registro de actividad, no de
+transcripciones). Ruta por defecto `~/.lmstudio/intern-activity.jsonl`,
+configurable con `INTERN_ACTIVITY_LOG`; `INTERN_ACTIVITY_LOG=off` lo desactiva.
+Si el archivo no se puede escribir, se ignora en silencio — la observabilidad
+nunca tumba una delegación.
+
+Es complementario al log de scoring manual
+([`templates/intern-usage-log.template.md`](templates/intern-usage-log.template.md)):
+este es automático y dice *qué pasó*; aquel es tu juicio de *qué tan bien salió*.
 
 ## Licencia
 

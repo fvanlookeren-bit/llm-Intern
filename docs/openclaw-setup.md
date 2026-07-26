@@ -105,6 +105,31 @@ O desde una sesión con `main`: pedile algo mecánico y masivo ("resumí estos N
 archivos") y confirmá que rutea al intern (`lm_studio_generate` / `lm_studio_agent`)
 en vez de producirlo con su propio modelo, y que después revisa/corrige.
 
+## Visibilidad: por qué no ves al intern en la UI (y cómo verlo)
+
+Si `tools.toolSearch.enabled` está en `true` — lo normal cuando tenés muchos MCPs —
+OpenClaw **no registra cada tool MCP por su nombre**. El modelo las descubre con
+`tool_search` y las invoca a través de un dispatcher genérico, así que en el
+historial y en la UI todas figuran como `tool_call`, no como
+`lm_studio_generate`. El intern trabaja igual, pero visualmente no se distingue
+del resto de las tools (a diferencia de Claude Code/Codex, donde cada tool MCP es
+de primera clase y aparece con su nombre).
+
+Apagar `toolSearch` lo arreglaría, pero registraría las ~N tools de todos tus MCPs
+en cada request — a partir de unas pocas decenas eso infla el contexto de cada
+llamada. No vale la pena solo por visibilidad.
+
+La forma barata es el **log de actividad del bridge**, que es independiente del
+host: `./bin/intern-watch` (ver la sección "Ver qué está haciendo el intern" del
+[README](../README.md)). Registra cada delegación con modelo, duración, qué MCP
+tools usó el intern y si falló — un `tail -f` en una terminal al lado te da lo
+mismo que verías en Claude Code.
+
+Alternativa dentro de OpenClaw: la **Control UI** (web) sí renderiza tool calls —
+tiene `showToolCalls` (activo por defecto) y `autoExpandToolCalls` para que vengan
+expandidas. Te muestra que hubo actividad de tools, aunque etiquetada por el
+dispatcher genérico.
+
 ## Interacción con piezas existentes de OpenClaw
 
 - **Guard / preload de LM Studio (si tenés uno):** garantizar que el modelo local

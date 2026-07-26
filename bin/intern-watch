@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Visor en vivo de la actividad del intern — el "tool output" que algunos hosts
+# no muestran. Funciona igual sea quien sea el que llama (OpenClaw, Claude Code,
+# Codex), porque lee el log que escribe el propio bridge.
+#
+#   intern-watch          # sigue la actividad en vivo (tail -f)
+#   intern-watch 30       # muestra las últimas 30 y sale
+#
+# El log lo escribe el bridge en ~/.lmstudio/intern-activity.jsonl
+# (configurable con INTERN_ACTIVITY_LOG; INTERN_ACTIVITY_LOG=off lo desactiva).
+set -euo pipefail
+
+LOG="${INTERN_ACTIVITY_LOG:-$HOME/.lmstudio/intern-activity.jsonl}"
+
+if [ "$(printf '%s' "$LOG" | tr '[:upper:]' '[:lower:]')" = "off" ]; then
+  echo "El log de actividad está desactivado (INTERN_ACTIVITY_LOG=off)." >&2
+  exit 1
+fi
+if [ ! -f "$LOG" ]; then
+  echo "Todavía no hay actividad registrada en $LOG" >&2
+  echo "(se crea en la primera delegación al intern)" >&2
+  exit 1
+fi
+
+FORMATTER="$(cd "$(dirname "$0")" && pwd)/intern-watch-format.py"
+
+if [ $# -gt 0 ]; then
+  tail -n "$1" "$LOG" | python3 "$FORMATTER"
+else
+  echo "Siguiendo la actividad del intern (Ctrl-C para salir) — $LOG"
+  tail -n 10 -f "$LOG" | python3 "$FORMATTER"
+fi

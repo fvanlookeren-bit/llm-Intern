@@ -33,6 +33,40 @@ const NATIVE_MODELS_URL = `${ORIGIN}/api/v0/models`;
 // dispare siempre ese preset, no un modelo al azar sin esa config.
 const DEFAULT_MODEL = process.env.LM_STUDIO_DEFAULT_MODEL ?? "qwen/qwen3.6-35b-a3b";
 
+// --- Log de actividad: una línea JSON por invocación del intern. ---
+//
+// Por qué existe: algunos hosts no muestran las tools MCP por su nombre. OpenClaw,
+// por ejemplo, con toolSearch activo invoca todo a través de un dispatcher genérico
+// (`tool_call`), así que en su UI no se distingue "el intern trabajó" de cualquier
+// otra tool. Este log es la fuente de verdad host-agnóstica: `tail -f` sobre él
+// muestra en vivo qué delegaciones están pasando, sin importar quién llame.
+//
+// Nunca debe romper una tool: si el archivo no se puede escribir, se ignora.
+// Desactivable con INTERN_ACTIVITY_LOG=off. Prompts truncados a propósito —
+// es un registro de actividad, no un archivo de transcripciones.
+const ACTIVITY_LOG_PATH =
+  process.env.INTERN_ACTIVITY_LOG ?? path.join(os.homedir(), ".lmstudio", "intern-activity.jsonl");
+const ACTIVITY_LOG_ENABLED = ACTIVITY_LOG_PATH.toLowerCase() !== "off";
+const ACTIVITY_SNIPPET_MAX = 160;
+
+function snippet(text: string | undefined, max = ACTIVITY_SNIPPET_MAX): string {
+  if (!text) return "";
+  const oneLine = text.replace(/\s+/g, " ").trim();
+  return oneLine.length > max ? `${oneLine.slice(0, max)}…` : oneLine;
+}
+
+function logActivity(entry: Record<string, unknown>): void {
+  if (!ACTIVITY_LOG_ENABLED) return;
+  try {
+    fs.appendFileSync(
+      ACTIVITY_LOG_PATH,
+      `${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`
+    );
+  } catch {
+    // Silencioso a propósito: la observabilidad nunca debe tumbar la delegación.
+  }
+}
+
 interface NativeModel {
   id: string;
   type?: string; // "llm" | "vlm" | "embeddings"
@@ -256,6 +290,7 @@ server.registerTool(
       if (context_length !== undefined) loadArgs.push("--context-length", String(context_length));
       await execFileAsync(lms, loadArgs, { timeout: 300000 });
       steps.push(`Cargado '${model}'.`);
+      logActivity({ tool: "lm_studio_load_model", model, exclusive, ok: true });
 
       const { stdout: ps } = await execFileAsync(lms, ["ps"]);
       return { content: [{ type: "text", text: `${steps.join("\n")}\n\nEstado actual (lms ps):\n${ps.trim()}` }] };
@@ -342,6 +377,7 @@ server.registerTool(
     },
   },
   async ({ prompt, system, model, temperature, max_tokens, response_schema }) => {
+    const startedAt = Date.now();
     const messages = [
       ...(system ? [{ role: "system", content: system }] : []),
       { role: "user", content: prompt },
@@ -374,6 +410,14 @@ server.registerTool(
     const text = choice?.message?.content || choice?.message?.reasoning_content || "";
     if (!text) {
       const reason = choice?.finish_reason ? ` (finish_reason: ${choice.finish_reason})` : "";
+      logActivity({
+        tool: "lm_studio_generate",
+        model: resolvedModel,
+        ms: Date.now() - startedAt,
+        ok: false,
+        prompt: snippet(prompt),
+        error: `sin contenido${reason}`,
+      });
       return {
         content: [
           {
@@ -384,6 +428,14 @@ server.registerTool(
         isError: true,
       };
     }
+    logActivity({
+      tool: "lm_studio_generate",
+      model: resolvedModel,
+      ms: Date.now() - startedAt,
+      ok: true,
+      prompt: snippet(prompt),
+      chars: text.length,
+    });
     return { content: [{ type: "text", text: text.trim() }] };
   }
 );
@@ -461,6 +513,7 @@ server.registerTool(
     },
   },
   async ({ prompt, mcp_servers, system, model, temperature, max_tokens, max_iterations, response_schema }, extra) => {
+    const startedAt = Date.now();
     const progressToken = extra?._meta?.progressToken;
     const configs = loadLmStudioMcpConfig();
     const missing = mcp_servers.filter((name) => !(name in configs));
@@ -662,6 +715,16 @@ server.registerTool(
       if (!finishedEarly) {
         // El for terminó sus max_iterations vueltas y en la última seguía
         // pidiendo tools — ahí sí se agotó el presupuesto de verdad.
+        logActivity({
+          tool: "lm_studio_agent",
+          model: resolvedModel,
+          ms: Date.now() - startedAt,
+          ok: false,
+          prompt: snippet(prompt),
+          mcp_servers,
+          tool_calls: toolTrace.length,
+          error: `sin respuesta final tras ${max_iterations} iteraciones`,
+        });
         return {
           content: [
             {
@@ -673,6 +736,16 @@ server.registerTool(
         };
       }
       if (!finalText) {
+        logActivity({
+          tool: "lm_studio_agent",
+          model: resolvedModel,
+          ms: Date.now() - startedAt,
+          ok: false,
+          prompt: snippet(prompt),
+          mcp_servers,
+          tool_calls: toolTrace.length,
+          error: "contenido final vacío",
+        });
         return {
           content: [
             {
@@ -724,6 +797,19 @@ server.registerTool(
           structuredError = err instanceof Error ? err.message : String(err);
         }
       }
+
+      logActivity({
+        tool: "lm_studio_agent",
+        model: resolvedModel,
+        ms: Date.now() - startedAt,
+        ok: true,
+        prompt: snippet(prompt),
+        mcp_servers,
+        tool_calls: toolTrace.length,
+        tools_used: [...new Set(toolTrace.map((t) => t.tool))],
+        tool_errors: toolTrace.filter((t) => t.error).length,
+        chars: finalText.length,
+      });
 
       const envelope = {
         final_text: finalText.trim(),
