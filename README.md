@@ -4,10 +4,13 @@
 [![Node](https://img.shields.io/badge/node-%3E%3D18-brightgreen)](package.json)
 [![MCP](https://img.shields.io/badge/protocol-MCP-blue)](https://modelcontextprotocol.io/)
 ![Works with](https://img.shields.io/badge/works%20with-Claude%20Code%20%C2%B7%20Codex%20%C2%B7%20OpenClaw-8a2be2)
+![Hosts](https://img.shields.io/badge/local%20host-LM%20Studio%20%C2%B7%20Bionic-informational)
 
-Servidor MCP que expone un modelo local de [LM Studio](https://lmstudio.ai/) como
-tools de **Claude Code**, **Codex** y **OpenClaw** — "el intern": delegación de
-trabajo mecánico o masivo a un modelo que corre gratis en tu propia máquina, para no
+Servidor MCP que expone un modelo local de [LM Studio](https://lmstudio.ai/) —
+o de **[Bionic](https://elementlabs.ai/)**, su derivado, ver
+[compatibilidad](#hosts-compatibles-lm-studio-y-bionic) — como tools de
+**Claude Code**, **Codex** y **OpenClaw**: "el intern", delegación de trabajo
+mecánico o masivo a un modelo que corre gratis en tu propia máquina, para no
 gastar cuota del modelo grande en tareas que no la necesitan.
 
 En Claude Code / Codex el intern es la **excepción** (el modelo grande es el doer por
@@ -63,11 +66,45 @@ criterio y no sea "mandarle cualquier cosa al modelo chico". Ver [`MODELS.md`](M
 | **Codex** | `[mcp_servers.lm-studio]` en `~/.codex/config.toml` | [`docs/codex-setup.md`](docs/codex-setup.md) |
 | **OpenClaw** | MCP tool en `openclaw.json` + protocolo intern-first (agente `main` como supervisor) | [`docs/openclaw-setup.md`](docs/openclaw-setup.md) |
 
+## Hosts compatibles: LM Studio y Bionic
+
+**Bionic** (Element Labs) es un derivado de LM Studio y funciona como **drop-in**:
+no hace falta configurar nada distinto. Verificado sobre una instalación con Bionic
+y sin LM Studio:
+
+| | LM Studio | Bionic |
+|---|---|---|
+| Home / config | `~/.lmstudio` | **el mismo** (`~/.lmstudio`, más un `~/.lmstudio-home-pointer`) |
+| Toolbox de `lm_studio_agent` | `~/.lmstudio/mcp.json` | el mismo |
+| Puerto por defecto | `1234` | el mismo |
+| API OpenAI-compat | `/v1/...` | la misma |
+| API nativa (estado de modelos) | `/api/v0/models` | la misma |
+| CLI | `lms` | el mismo binario (idéntico SHA al que trae en su bundle) |
+
+Si tu instalación no dejó `~/.lmstudio/bin/lms` linkeado, el bridge también busca
+el `lms` dentro del bundle de la app. Podés forzar la ruta con `LMS_PATH`.
+
+### Caveat importante: LM Link (modelos en otras máquinas)
+
+Si tenés **LM Link** activo, un modelo cargado en OTRO equipo aparece en este host
+como `state: "loaded"`, y `/api/v0/models` **no dice en qué máquina está**. Dos
+consecuencias:
+
+- **El intern puede estar corriendo en otra máquina** sin que se note desde la API.
+  Para ver dónde: `lms ps` (columna DEVICE) o `lms link status`.
+- **`lm_studio_load_model` con `exclusive: true` nunca descarga instancias de otros
+  equipos** — un barrido masivo podría apagar el modelo del que depende un agente
+  allá. Si de verdad querés incluirlas, pasá `include_remote: true` a conciencia.
+
+Además, con un *preferred device* configurado, `lms load` carga en **ese** equipo,
+no necesariamente en el tuyo — así que `exclusive` garantiza exclusividad donde
+efectivamente cargue, no "en mi laptop".
+
 ## Quickstart
 
-Prerrequisito: [LM Studio](https://lmstudio.ai/) instalado, con al menos un modelo
-descargado y el servidor local activo (`http://localhost:1234`). Ver
-[`docs/lm-studio-setup.md`](docs/lm-studio-setup.md).
+Prerrequisito: [LM Studio](https://lmstudio.ai/) o [Bionic](https://elementlabs.ai/)
+instalado, con al menos un modelo descargado y el servidor local activo
+(`http://localhost:1234`). Ver [`docs/lm-studio-setup.md`](docs/lm-studio-setup.md).
 
 ```bash
 git clone https://github.com/fvanlookeren-bit/llm-Intern.git

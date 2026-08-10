@@ -1,8 +1,14 @@
-# Setup de LM Studio
+# Setup del host local (LM Studio o Bionic)
+
+> **Bionic** (Element Labs) es un derivado de LM Studio y sirve igual, sin cambiar
+> nada: mismo home `~/.lmstudio`, mismo `mcp.json`, mismo puerto 1234, mismos
+> endpoints `/v1` y `/api/v0`, y el mismo CLI `lms`. Todo lo de esta guía aplica a
+> ambos — donde dice "LM Studio", leé "LM Studio o Bionic". Ver la tabla de
+> compatibilidad y el caveat de LM Link en el [README](../README.md#hosts-compatibles-lm-studio-y-bionic).
 
 Requisitos antes de instalar el bridge:
 
-1. [LM Studio](https://lmstudio.ai/) instalado.
+1. [LM Studio](https://lmstudio.ai/) o [Bionic](https://elementlabs.ai/) instalado.
 2. Al menos un modelo descargado (ver [`MODELS.md`](../MODELS.md) para recomendaciones).
 3. El servidor local activado: en la app, pestaña **Developer** (ícono `</>`) →
    **Start Server**. Por defecto queda en `http://localhost:1234`.

@@ -13,13 +13,66 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
-// Ubica el CLI `lms` de LM Studio (necesario para lm_studio_load_model). Orden:
-// LMS_PATH explícito → ~/.lmstudio/bin/lms → confiar en el PATH.
+// Ubica el CLI `lms` (necesario para lm_studio_load_model). Orden: LMS_PATH
+// explícito → ~/.lmstudio/bin/lms → bundle de la app → el PATH.
+// Sirve igual para LM Studio y para Bionic (Element Labs):
+// Bionic es un derivado que comparte el mismo home `~/.lmstudio` e instala ahí
+// el mismo binario `lms` (verificado: mismo SHA que el que trae en su bundle).
+// El fallback al bundle cubre una instalación donde `~/.lmstudio/bin/lms` no
+// quedó linkeado.
 function resolveLmsBinary(): string {
   if (process.env.LMS_PATH) return process.env.LMS_PATH;
-  const home = path.join(os.homedir(), ".lmstudio", "bin", "lms");
-  if (fs.existsSync(home)) return home;
+  const candidates = [
+    path.join(os.homedir(), ".lmstudio", "bin", "lms"),
+    "/Applications/Bionic.app/Contents/Resources/app/.webpack-bionic/lms",
+    "/Applications/LM Studio.app/Contents/Resources/app/.webpack/lms",
+  ];
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
   return "lms";
+}
+
+interface LoadedInstance {
+  identifier: string;
+  deviceIdentifier?: string;
+  remote: boolean;
+}
+
+// Devuelve los modelos cargados y si cada uno vive en ESTA máquina o en otra
+// vía LM Link. `/api/v0/models` no expone el device, así que la única fuente
+// confiable es el CLI: `lms link status` lista los identifiers de los equipos
+// REMOTOS, y `lms ps --json` trae el deviceIdentifier de cada instancia cargada.
+// Si algo falla (no hay CLI, formato distinto), se devuelve lista vacía y quien
+// llame debe tratarlo como "no sé" en vez de asumir que todo es local.
+async function listLoadedInstances(lms: string): Promise<LoadedInstance[]> {
+  const remoteDevices = new Set<string>();
+  try {
+    // Ojo: `lms link status` imprime en STDERR, no en stdout (verificado). Leer
+    // solo stdout devolvía cero devices y hacía que un modelo remoto se
+    // clasificara como local — justo el caso que este chequeo debe evitar.
+    const { stdout, stderr } = await execFileAsync(lms, ["link", "status"], { timeout: 15000 });
+    for (const m of `${stdout}\n${stderr}`.matchAll(/Identifier:\s*([0-9a-f]{8,})/gi)) {
+      remoteDevices.add(m[1]);
+    }
+  } catch {
+    // LM Link puede estar apagado o el comando no existir: sin devices remotos
+    // conocidos, todo lo cargado se considera local.
+  }
+
+  try {
+    const { stdout } = await execFileAsync(lms, ["ps", "--json"], { timeout: 15000 });
+    const rows = JSON.parse(stdout) as Array<{ identifier?: string; deviceIdentifier?: string }>;
+    return rows
+      .filter((r) => r.identifier)
+      .map((r) => ({
+        identifier: r.identifier as string,
+        deviceIdentifier: r.deviceIdentifier,
+        remote: Boolean(r.deviceIdentifier && remoteDevices.has(r.deviceIdentifier)),
+      }));
+  } catch {
+    return [];
+  }
 }
 
 const BASE_URL = process.env.LM_STUDIO_BASE_URL ?? "http://localhost:1234/v1";
@@ -101,16 +154,21 @@ async function listNativeModels(): Promise<NativeModel[]> {
 }
 
 // Prefiere un modelo ya cargado en memoria (state: "loaded") antes que dejar
-// que LM Studio haga JIT-load del primero del catálogo — así se usa lo que
+// que el host haga JIT-load del primero del catálogo — así se usa lo que
 // el usuario ya tiene corriendo en la app, no un modelo al azar.
 //
-// /api/v0/models solo devuelve modelos REALMENTE locales a esta Mac (verificado:
-// las filas con ícono de red "LM Link" que aparecen en la UI de LM Studio para
-// modelos disponibles en otra instancia NO salen por esta API). Aun así, cuando
-// alguien pasa 'model' explícito (ej. siguiendo la guía de selección del
-// protocolo del intern) no hay que confiar ciegamente en el string — validar
-// contra el catálogo real evita que LM Studio intente resolver un ID que no
-// está local (typo, o un ID que solo existe vía LM Link) y falle.
+// OJO con LM Link (corrección 2026-08): la suposición vieja era que
+// /api/v0/models solo devolvía modelos locales a esta máquina. **Es falsa.**
+// Con LM Link activo, un modelo cargado en OTRO equipo aparece acá con
+// state:"loaded" (verificado con Bionic: el único "loaded" corría en otra Mac,
+// confirmado con `lms ps --json` → deviceIdentifier y `lms link status`).
+// El endpoint no expone el device, así que desde la API REST no se puede
+// distinguir local de remoto — solo el CLI `lms` lo sabe.
+//
+// Consecuencias prácticas: (1) el intern puede terminar corriendo en otra
+// máquina, lo cual funciona pero cambia dónde se gasta la RAM/CPU; (2) validar
+// el 'model' explícito contra el catálogo sigue valiendo la pena para atajar
+// typos, pero "está en el catálogo" ya no implica "está descargado acá".
 async function resolveModel(model?: string): Promise<string> {
   const models = await listNativeModels();
   const localNonEmbedding = models.filter((m) => m.type !== "embeddings");
@@ -119,8 +177,8 @@ async function resolveModel(model?: string): Promise<string> {
     if (localNonEmbedding.some((m) => m.id === model)) return model;
     const available = localNonEmbedding.map((m) => m.id).join(", ") || "(ninguno)";
     throw new Error(
-      `El modelo '${model}' no está entre los modelos locales de esta Mac (puede ser un ID inválido, o uno visible ` +
-        `solo vía LM Link en la app pero no descargado acá). Modelos locales disponibles: ${available}`
+      `El modelo '${model}' no está en el catálogo que reporta el host (puede ser un ID inválido o un modelo ` +
+        `no descargado). Modelos disponibles: ${available}`
     );
   }
 
@@ -227,15 +285,17 @@ server.registerTool(
 server.registerTool(
   "lm_studio_load_model",
   {
-    title: "Cargar un modelo en LM Studio (con descarga exclusiva)",
+    title: "Cargar un modelo (con descarga exclusiva local)",
     description:
-      "Carga un modelo específico en LM Studio vía el CLI `lms`, opcionalmente descargando TODOS los demás " +
-      "primero (exclusive=true, default). Resuelve de raíz el problema recurrente de 'modelo equivocado " +
-      "cargado': llamá esto ANTES de una tanda de trabajo con un modelo concreto (ej. qwen3-coder-30b para " +
-      "código) para garantizar que ese, y solo ese, esté en memoria — así lm_studio_generate/lm_studio_agent " +
-      "no toman por error un modelo que quedó cargado de otra sesión. Requiere el CLI `lms` instalado " +
-      "(viene con LM Studio; se busca en LMS_PATH, ~/.lmstudio/bin/lms, o el PATH). Devuelve el estado de " +
-      "`lms ps` al terminar para que confirmes qué quedó cargado.",
+      "Carga un modelo específico vía el CLI `lms`, descargando primero los demás modelos cargados " +
+      "**en esta máquina** (exclusive=true, default). Resuelve de raíz el problema recurrente de 'modelo " +
+      "equivocado cargado': llamá esto ANTES de una tanda de trabajo con un modelo concreto (ej. un modelo " +
+      "de código) para garantizar que ese, y solo ese, esté en memoria — así lm_studio_generate/" +
+      "lm_studio_agent no toman por error un modelo que quedó cargado de otra sesión. " +
+      "**Seguro con LM Link:** si hay instancias cargadas en OTROS equipos, no se tocan (un `unload --all` " +
+      "las apagaría y podría tumbar el modelo del que depende un agente allá). " +
+      "Requiere el CLI `lms` (lo instalan tanto LM Studio como Bionic; se busca en LMS_PATH, " +
+      "~/.lmstudio/bin/lms, el bundle de la app, o el PATH). Devuelve `lms ps` al terminar.",
     inputSchema: {
       model: z
         .string()
@@ -244,13 +304,22 @@ server.registerTool(
         .boolean()
         .optional()
         .default(true)
-        .describe("Si true (default), descarga todos los demás modelos antes de cargar este — deja solo este en memoria."),
+        .describe("Si true (default), descarga los demás modelos cargados EN ESTA MÁQUINA antes de cargar este. Las instancias en otros equipos (LM Link) nunca se tocan."),
+      include_remote: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe(
+          "Solo aplica con exclusive=true. Si true, la descarga previa ALCANZA TAMBIÉN a las instancias " +
+            "cargadas en otros equipos vía LM Link. Peligroso: si en ese equipo corre un agente que depende " +
+            "de su modelo, se lo apagás. Usalo solo si sabés que esas máquinas no están sirviendo a nadie."
+        ),
       ttl: z
         .number()
         .int()
         .positive()
         .optional()
-        .describe("Segundos de inactividad tras los cuales LM Studio descarga el modelo (auto-unload). Omitir = sin TTL."),
+        .describe("Segundos de inactividad tras los cuales el host descarga el modelo (auto-unload). Omitir = sin TTL."),
       context_length: z
         .number()
         .int()
@@ -259,7 +328,7 @@ server.registerTool(
         .describe("Longitud de contexto a usar al cargar. Omitir = default del modelo."),
     },
   },
-  async ({ model, exclusive, ttl, context_length }) => {
+  async ({ model, exclusive, include_remote, ttl, context_length }) => {
     // Validar el ID contra el catálogo local antes de invocar lms (mismo criterio
     // que resolveModel para un 'model' explícito) — evita un lms load que falle o,
     // peor, matchee parcialmente otro modelo.
@@ -282,15 +351,35 @@ server.registerTool(
     const steps: string[] = [];
     try {
       if (exclusive) {
-        await execFileAsync(lms, ["unload", "--all"]);
-        steps.push("Descargados todos los modelos previos (unload --all).");
+        // NO usar `unload --all`: con LM Link, `lms ps` incluye instancias
+        // cargadas en OTRAS máquinas, y un unload masivo las apagaría — puede
+        // tumbar el modelo del que depende un agente corriendo en ese otro
+        // equipo. Se descargan solo las instancias locales, una por una.
+        const loaded = await listLoadedInstances(lms);
+        const toUnload = include_remote ? loaded : loaded.filter((i) => !i.remote);
+        const spared = include_remote ? [] : loaded.filter((i) => i.remote);
+
+        for (const inst of toUnload) {
+          await execFileAsync(lms, ["unload", inst.identifier], { timeout: 60000 });
+        }
+        steps.push(
+          toUnload.length
+            ? `Descargado(s) ${toUnload.length} modelo(s): ${toUnload.map((i) => i.identifier).join(", ")}.`
+            : "No había modelos que descargar."
+        );
+        if (spared.length) {
+          steps.push(
+            `Respetada(s) ${spared.length} instancia(s) en otros equipos (LM Link): ` +
+              `${spared.map((i) => i.identifier).join(", ")} — no se tocaron (usá include_remote:true para incluirlas).`
+          );
+        }
       }
       const loadArgs = ["load", model, "-y"];
       if (ttl !== undefined) loadArgs.push("--ttl", String(ttl));
       if (context_length !== undefined) loadArgs.push("--context-length", String(context_length));
       await execFileAsync(lms, loadArgs, { timeout: 300000 });
       steps.push(`Cargado '${model}'.`);
-      logActivity({ tool: "lm_studio_load_model", model, exclusive, ok: true });
+      logActivity({ tool: "lm_studio_load_model", model, exclusive, include_remote, ok: true });
 
       const { stdout: ps } = await execFileAsync(lms, ["ps"]);
       return { content: [{ type: "text", text: `${steps.join("\n")}\n\nEstado actual (lms ps):\n${ps.trim()}` }] };
@@ -347,11 +436,11 @@ server.registerTool(
       "mecánico o masivo: borradores largos, transformaciones repetitivas, resúmenes, reescritura de texto, " +
       "generación de boilerplate. No usar para tareas que requieran razonamiento complejo, uso de otras " +
       "herramientas, o alta precisión — para eso conviene que Claude lo haga directo. " +
-      "Nota sobre modelos con 'thinking' (Qwen3, etc.): el server intenta desactivar el razonamiento " +
-      "(chat_template_kwargs.enable_thinking=false) pero LM Studio actualmente IGNORA ese flag vía API/REST " +
-      "para varios modelos (limitación conocida de LM Studio, no de esta tool) — el modelo puede seguir " +
-      "'pensando' y tardar más de lo esperado. La única forma confiable de apagarlo es editar el Prompt " +
-      "Template del modelo en la app de LM Studio y agregar '{%- set enable_thinking = false %}' al inicio.",
+      "Nota sobre modelos con 'thinking' (Qwen3, Gemma, etc.): el server manda reasoning_effort='none', que " +
+      "verificado el 2026-08-05 SÍ apaga el razonamiento vía API (0 reasoning_tokens en qwen3.6-35b-a3b y " +
+      "gemma-4-26b-a4b-qat). Se mantiene además chat_template_kwargs.enable_thinking=false por compatibilidad, " +
+      "pero ese flag por sí solo LM Studio lo ignora vía API/REST: sin reasoning_effort el modelo gasta todo " +
+      "max_tokens 'pensando' y devuelve content vacío (era la causa de los reportes de 'respuesta vacía').",
     inputSchema: {
       prompt: z.string().describe("El prompt / tarea a ejecutar en el modelo local."),
       system: z
@@ -391,9 +480,10 @@ server.registerTool(
         messages,
         temperature,
         max_tokens,
-        // Best-effort: algunos backends de LM Studio (no todos) respetan esto
-        // para desactivar el "thinking" de modelos tipo Qwen3. Ver nota en la
-        // descripción de esta tool sobre la limitación conocida.
+        // reasoning_effort es el que realmente apaga el "thinking" vía API
+        // (verificado: 0 reasoning_tokens). enable_thinking se deja por
+        // compatibilidad, pero solo LM Studio lo ignora en el server REST.
+        reasoning_effort: "none",
         chat_template_kwargs: { enable_thinking: false },
         ...(response_schema
           ? { response_format: { type: "json_schema", json_schema: { name: "response", strict: true, schema: response_schema } } }
@@ -618,6 +708,11 @@ server.registerTool(
             tool_choice: "auto",
             temperature,
             max_tokens,
+            // Igual que en lm_studio_generate: sin esto el modelo gasta todo
+            // max_tokens pensando y devuelve content vacío, lo que corta el
+            // loop de tools. Si alguna vez empeora la ELECCIÓN de tools,
+            // esta es la línea a revertir (solo acá, no en generate).
+            reasoning_effort: "none",
             chat_template_kwargs: { enable_thinking: false },
           }),
         })) as {
