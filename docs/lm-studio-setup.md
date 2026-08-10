@@ -1,10 +1,14 @@
 # Setup del host local (LM Studio o Bionic)
 
-> **Bionic** (Element Labs) es un derivado de LM Studio y sirve igual, sin cambiar
-> nada: mismo home `~/.lmstudio`, mismo `mcp.json`, mismo puerto 1234, mismos
-> endpoints `/v1` y `/api/v0`, y el mismo CLI `lms`. Todo lo de esta guía aplica a
-> ambos — donde dice "LM Studio", leé "LM Studio o Bionic". Ver la tabla de
-> compatibilidad y el caveat de LM Link en el [README](../README.md#hosts-compatibles-lm-studio-y-bionic).
+> **Host recomendado: LM Studio.** **Bionic** (Element Labs) es un derivado que a
+> nivel de integración funciona igual sin cambiar nada (mismo home `~/.lmstudio`,
+> mismo `mcp.json`, mismo puerto 1234, mismos endpoints, mismo CLI `lms`), pero en
+> la versión 1.0.6 **no puede cargar modelos grandes**: un bug de AutoFit exige un
+> contexto mínimo imposible y no responde a ninguna configuración. El mismo modelo
+> carga bien en LM Studio en la misma máquina. Evidencia completa en el
+> [README](../README.md#bionic-106-no-carga-modelos-grandes-bug-de-autofit).
+> Donde esta guía dice "LM Studio", el bridge también acepta Bionic — pero para
+> modelos grandes, usá LM Studio.
 
 Requisitos antes de instalar el bridge:
 

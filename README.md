@@ -4,14 +4,16 @@
 [![Node](https://img.shields.io/badge/node-%3E%3D18-brightgreen)](package.json)
 [![MCP](https://img.shields.io/badge/protocol-MCP-blue)](https://modelcontextprotocol.io/)
 ![Works with](https://img.shields.io/badge/works%20with-Claude%20Code%20%C2%B7%20Codex%20%C2%B7%20OpenClaw-8a2be2)
-![Hosts](https://img.shields.io/badge/local%20host-LM%20Studio%20%C2%B7%20Bionic-informational)
+![Hosts](https://img.shields.io/badge/local%20host-LM%20Studio-informational)
 
-Servidor MCP que expone un modelo local de [LM Studio](https://lmstudio.ai/) —
-o de **[Bionic](https://elementlabs.ai/)**, su derivado, ver
-[compatibilidad](#hosts-compatibles-lm-studio-y-bionic) — como tools de
-**Claude Code**, **Codex** y **OpenClaw**: "el intern", delegación de trabajo
-mecánico o masivo a un modelo que corre gratis en tu propia máquina, para no
+Servidor MCP que expone un modelo local de [LM Studio](https://lmstudio.ai/) como
+tools de **Claude Code**, **Codex** y **OpenClaw**: "el intern", delegación de
+trabajo mecánico o masivo a un modelo que corre gratis en tu propia máquina, para no
 gastar cuota del modelo grande en tareas que no la necesitan.
+
+> **Sobre Bionic:** el código es compatible (es un derivado de LM Studio y comparte
+> todo), pero **hoy no lo recomiendo** — tiene un bug que impide cargar modelos
+> grandes. Detalle y evidencia en [Hosts compatibles](#hosts-compatibles-lm-studio-y-bionic).
 
 En Claude Code / Codex el intern es la **excepción** (el modelo grande es el doer por
 defecto). En OpenClaw el agente `main` lo usa **al revés**: es supervisor y **exprime
@@ -68,9 +70,11 @@ criterio y no sea "mandarle cualquier cosa al modelo chico". Ver [`MODELS.md`](M
 
 ## Hosts compatibles: LM Studio y Bionic
 
-**Bionic** (Element Labs) es un derivado de LM Studio y funciona como **drop-in**:
-no hace falta configurar nada distinto. Verificado sobre una instalación con Bionic
-y sin LM Studio:
+**Host recomendado: LM Studio.**
+
+**Bionic** (Element Labs) es un derivado de LM Studio y a nivel de integración es un
+**drop-in** — el bridge funciona sin cambiar nada. Verificado sobre una instalación
+con Bionic y sin LM Studio:
 
 | | LM Studio | Bionic |
 |---|---|---|
@@ -83,6 +87,44 @@ y sin LM Studio:
 
 Si tu instalación no dejó `~/.lmstudio/bin/lms` linkeado, el bridge también busca
 el `lms` dentro del bundle de la app. Podés forzar la ruta con `LMS_PATH`.
+
+### Bionic 1.0.6: no carga modelos grandes (bug de AutoFit)
+
+**Con Bionic 1.0.6+5, un modelo de ~20 GB (MoE 35B, 4-bit MLX) resultó imposible de
+cargar.** El error:
+
+```
+Error: MLX AutoFit selected a context length of 183296,
+       below the required minimum of 2014607.
+```
+
+Ese "mínimo requerido" es **imposible**: 2.014.607 de contexto para un modelo cuyo
+máximo declarado son 262.144. Y es **errático** — en otra corrida, con la misma
+config, pidió `193825`.
+
+No responde a **ningún** input. Probado y descartado uno por uno:
+
+| Intento | Resultado |
+|---|---|
+| `--context-length` 262144 / 131072 / **4096** | idéntico error, mismos números |
+| `--parallel` 4 / 3 / 1 | idéntico |
+| Editar `contextLength` del preset (262144 → 183296 → 65536) | idéntico |
+| Bajar `modelLoadingGuardrails` de `medium` a `low` | idéntico |
+| Reiniciar la app (para que reelea la config) | idéntico |
+| RAM libre al 81 % de 48 GB, nada más cargado | idéntico |
+
+**La prueba de que es de Bionic y no del hardware:** en la misma máquina, con la
+misma RAM, el mismo `~/.lmstudio` y el mismo preset, **LM Studio carga ese modelo
+sin problema — justamente con contexto 183296**, el valor que AutoFit proponía y que
+Bionic rechazaba contra su mínimo imposible.
+
+Detalle secundario, útil si aparece un caso parecido: los modelos de **visión**
+(`type: vlm`) no admiten cuantización de KV cache, que es la palanca que reduciría la
+memoria — comprobado en los presets (un modelo text-only equivalente sí la tiene
+activada). Eso agrava el consumo, pero no explica el mínimo imposible.
+
+Conclusión: el bridge queda compatible con Bionic por si lo arreglan, pero **hoy
+usá LM Studio** si vas a correr modelos grandes.
 
 ### Caveat importante: LM Link (modelos en otras máquinas)
 

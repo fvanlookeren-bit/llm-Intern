@@ -64,6 +64,21 @@ Elegí la cuantización según tu RAM disponible (4-bit para equipos con menos m
 unificada, 8-bit/full si te sobra). En Apple Silicon, preferí siempre la variante MLX
 sobre GGUF — corre notablemente más rápido en ese hardware.
 
+## Vision vs text-only: importa para la memoria
+
+Los modelos de **visión** (`type: vlm` en `/api/v0/models`) **no admiten cuantización
+de KV cache** en LM Studio. Los **text-only** (`type: llm`) sí. Con contextos grandes
+esa es la diferencia entre entrar en RAM o no: comprobado en los presets de una misma
+instalación, un MoE text-only tenía `kvCacheQuantization.enabled: true` a 4 bits con
+262144 de contexto, mientras el equivalente con visión lo tenía forzado en `false`.
+
+Si te pelea la memoria con un modelo grande, revisá primero si es `vlm`. Ojo: casi
+toda la generación reciente de Qwen (3.5/3.6, tanto 27B como 35B-A3B) es multimodal
+por arquitectura (`ForConditionalGeneration` + `vision_config`), así que **no existe
+una variante text-only de esos modelos** — hay que cambiar de familia, no de quant.
+Para verificarlo antes de descargar 20 GB, mirá el `config.json` del repo en Hugging
+Face: si tiene `vision_config`, es vlm.
+
 ## Desactivar el "thinking" (recomendado)
 
 Los modelos Qwen3 razonan por defecto antes de responder, lo cual es lento y no
