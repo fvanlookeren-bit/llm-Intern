@@ -497,7 +497,15 @@ server.registerTool(
     };
 
     const choice = data.choices?.[0];
-    const text = choice?.message?.content || choice?.message?.reasoning_content || "";
+    // Si `content` viene vacío pero hay `reasoning_content`, el modelo gastó el
+    // presupuesto pensando y nunca emitió la respuesta. Se devuelve igual (a veces
+    // el razonamiento contiene algo aprovechable), pero MARCADO: pasarlo como si
+    // fuera la respuesta hace que el caller acepte "pensamiento en voz alta" como
+    // entregable — verificado con un modelo sin thinking-off, que devolvió 1557
+    // palabras de razonamiento y cero de historia con isError:false.
+    const rawContent = choice?.message?.content || "";
+    const reasoningOnly = !rawContent && Boolean(choice?.message?.reasoning_content);
+    const text = rawContent || choice?.message?.reasoning_content || "";
     if (!text) {
       const reason = choice?.finish_reason ? ` (finish_reason: ${choice.finish_reason})` : "";
       logActivity({
@@ -522,10 +530,27 @@ server.registerTool(
       tool: "lm_studio_generate",
       model: resolvedModel,
       ms: Date.now() - startedAt,
-      ok: true,
+      ok: !reasoningOnly,
       prompt: snippet(prompt),
       chars: text.length,
+      ...(reasoningOnly ? { error: "solo reasoning_content, sin respuesta final" } : {}),
     });
+    if (reasoningOnly) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `⚠️ El modelo '${resolvedModel}' NO produjo respuesta: gastó el presupuesto de tokens ` +
+              `razonando y 'content' vino vacío. Abajo va el razonamiento crudo — NO lo trates como el ` +
+              `entregable. Arreglo: desactivá el thinking de ese modelo (Prompt Template en la app, ` +
+              `'{%- set enable_thinking = false %}'); el flag por API no alcanza. O subí max_tokens.\n\n` +
+              `--- reasoning_content ---\n${text.trim()}`,
+          },
+        ],
+        isError: true,
+      };
+    }
     return { content: [{ type: "text", text: text.trim() }] };
   }
 );
