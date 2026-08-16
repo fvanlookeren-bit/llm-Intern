@@ -1,6 +1,6 @@
 ---
 name: intern
-description: Delega trabajo mecánico/masivo y de bajo razonamiento a un modelo LLM local en LM Studio (vía MCP lm-studio), en vez de gastar cuota del modelo grande. Usar cuando el usuario dice "usa el intern"/"el intern", o proactivamente para tareas mecánicas de bajo riesgo (borradores largos, resúmenes, transformaciones repetitivas, boilerplate) antes de hacerlas directo.
+description: Delega trabajo a un modelo LLM local en LM Studio (vía MCP lm-studio) en vez de gastar cuota del modelo grande, en dos tiers - "subagent" para trabajo autónomo con tools (leer archivos, explorar, usar MCPs) e "intern" para transformación mecánica de texto. Delegar es el DEFAULT, no la excepción - usar proactivamente, sin esperar a que el usuario diga "usa el intern", en borradores largos, transformaciones repetitivas, resúmenes, boilerplate y exploración acotada de archivos. Saltearlo solo en alta precisión/impacto real (bugs, vulnerabilidades, arquitectura) o cuando explicarle el contexto cuesta más que hacerlo.
 ---
 
 # Intern (LM Studio local)
@@ -15,35 +15,50 @@ para decidir bien CUÁNDO delegar y CON QUÉ modelo, no solo cómo llamar la too
 que hacerlo directo. El intern es el MCP `lm-studio` — un modelo distinto, gratis,
 local.
 
-## 1. Tools disponibles
+## 1. Dos tiers, y las tools de cada uno
 
-Elegí según si la tarea necesita herramientas reales:
+`lm_studio_list_models` muestra el `tier=` de cada modelo:
+
+- **`subagent` (junior)** — contexto largo y tool-calling confiable. Se le delega con
+  **autonomía**: que lea los archivos él mismo, en vez de masticarle el contexto.
+- **`intern`** — el resto. Delegación mecánica, todo el contexto en el prompt.
+
+El roster se configura con `LM_STUDIO_SUBAGENT_MODELS="id-a,id-b"`. Es curado a
+propósito: el host reporta `tool_use` para **todos** los modelos no-embedding, hasta
+los de 1-2B, así que esa capability no sirve para decidir a quién confiarle un loop.
+
+Tools:
 
 - **`lm_studio_generate`** — solo texto/código, POST directo al modelo, **sin
-  tools**. Dale todo el contexto necesario en el prompt (datos, texto fuente,
-  resultados de tus propias tool calls) — no puede ir a buscar nada él mismo.
-- **`lm_studio_agent`** — **con tools MCP reales**. Le pasás `mcp_servers` (nombres
-  de `~/.lmstudio/mcp.json`, listalos con `lm_studio_list_mcp_servers` antes) y
-  corre un loop de agente real: llama tools, lee resultados, repite hasta terminar
-  (tope `max_iterations`, default 8). Usá el mínimo de MCPs necesario — cada uno
-  agrega tools al contexto del modelo.
-- **`lm_studio_list_models`** — qué modelos hay y cuál está cargado ahora.
+  tools**. Tier intern. Dale todo el contexto necesario en el prompt (datos, texto
+  fuente, resultados de tus propias tool calls) — no puede ir a buscar nada él mismo.
+- **`lm_studio_agent`** — **con tools MCP reales**. Tier subagent. Le pasás
+  `mcp_servers` (nombres de `~/.lmstudio/mcp.json`, listalos con
+  `lm_studio_list_mcp_servers` antes) y corre un loop de agente real: llama tools, lee
+  resultados, repite hasta terminar (tope `max_iterations`, default 8). Usá el mínimo
+  de MCPs necesario — cada uno agrega tools al contexto del modelo. **Verificá cada
+  dato contra el `tool_trace` que devuelve, no contra su prosa.**
+- **`lm_studio_capacity`** — techo de memoria, modelos residentes y margen libre.
+  Llamala antes de cargar un segundo modelo.
+- **`lm_studio_list_models`** — qué modelos hay, cuál está cargado y en qué tier.
 - **`lm_studio_list_mcp_servers`** — qué MCPs puede usar `lm_studio_agent`.
 
-## 2. Cuándo delegar
+## 2. Cuándo delegar — delegar es el default
 
 Trabajo mecánico/masivo y de bajo razonamiento: borradores largos, transformaciones
-repetitivas, resúmenes, reescritura de texto, boilerplate, investigación acotada con
-`lm_studio_agent`.
+repetitivas, resúmenes, reescritura de texto, boilerplate. Y también **exploración
+acotada con `lm_studio_agent`**: "leé estos archivos y resumime", "buscá X y
+clasificá" — con el tier subagent eso se delega, no se hace directo por costumbre.
 
-**No delegar sin más** (evaluar el modelo primero, ver sección 3, antes de descartar):
-tareas de razonamiento complejo o alta precisión. Reservar "nunca delegar" para lo
-genuinamente de alto impacto — bugs, vulnerabilidades, arquitectura, decisiones con
-consecuencia real. Ahí el riesgo es de confiabilidad, no de tiempo, y ningún modelo
-local da la garantía que da el modelo grande.
+Hacerlo directo, sin delegar, solo si: (a) es alta precisión/impacto real — bugs,
+vulnerabilidades, arquitectura, decisiones con consecuencia; (b) es ambiguo o urgente
+y no hay margen para iterar; o (c) depende de contexto de la conversación que sería
+más caro de explicarle que de hacer. Si hacés directo algo que entraba acá, decí en
+una línea por qué.
 
-Si el pedido de delegar es ambiguo, priorizar calidad (hacerlo directo) salvo que el
-usuario insista.
+**Calibrá el umbral con tus propios datos.** Al sacar el promedio del log, filtrá
+**solo las filas cuya herramienta empiece con `lm_studio_`**: mezclar filas de otras
+herramientas da un número que no dice nada sobre el intern.
 
 ## 3. Selección de modelo
 
@@ -52,10 +67,16 @@ qué modelo sirvió para qué tipo de tarea. Regla general: si el tiempo no apre
 probar un modelo más capaz antes de asumir que ninguno puede — el cómputo local es
 gratis, así que la lentitud extra solo cuesta tiempo.
 
-**Un solo modelo cargado a la vez, siempre elegido a propósito.** `resolveModel()`
-prefiere lo que ya esté cargado en memoria; si dejás más de uno cargado de otra
-sesión, el bridge puede usar el equivocado sin avisar. Si vas a probar un modelo
-puntual, cargalo explícito (parámetro `model`) y descargá los demás.
+**Varios modelos a la vez: permitido, con chequeo.** `resolveModel()` desambigua por
+tier — `lm_studio_generate` toma uno intern y `lm_studio_agent` uno subagent — así que
+un subagente grande y un intern chico conviven sin pisarse. Si hay **dos del mismo
+tier** cargados, ya no adivina: tira error y hay que pasar `model` explícito.
+
+Antes de sumar un modelo, `lm_studio_capacity`. `lm_studio_load_model` con
+`exclusive:false` verifica que entre y aborta con números si no; el auto-fit del host
+no hace esa cuenta (dimensiona cada modelo como si fuera el único), y el
+sobre-compromiso se manifiesta como swap, no como error. El host además **recorta el
+`context_length` pedido en silencio** — verificá el valor real en `lms ps`.
 
 ## 4. Umbral de descarte
 

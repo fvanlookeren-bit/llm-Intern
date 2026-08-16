@@ -49,11 +49,12 @@ criterio y no sea "mandarle cualquier cosa al modelo chico". Ver [`MODELS.md`](M
 
 ## Qué incluye
 
-- **`src/index.ts`** — el servidor MCP (Node/TypeScript). Cinco tools:
-  - `lm_studio_generate` — texto/código sin herramientas, todo el contexto va en el prompt. Soporta `response_schema` (JSON Schema) para forzar salida estructurada.
-  - `lm_studio_agent` — el modelo local con acceso real a tus otros MCPs (`~/.lmstudio/mcp.json`), loop de agente completo. Devuelve `tool_trace` (qué tool se llamó, con qué args, qué devolvió) para auditar cada dato de la respuesta, y soporta `response_schema` para forzar el formato final. Ver [`docs/audit-tasks-pattern.md`](docs/audit-tasks-pattern.md) para el patrón de uso en tareas de extracción/auditoría.
-  - `lm_studio_load_model` — carga un modelo concreto con descarga exclusiva de los demás (vía el CLI `lms`). Llamalo antes de una tanda con un modelo específico para garantizar que ese, y solo ese, esté en memoria — mata de raíz el "modelo equivocado cargado".
-  - `lm_studio_list_models` — qué hay descargado/cargado en LM Studio.
+- **`src/index.ts`** — el servidor MCP (Node/TypeScript). Seis tools, organizadas en **dos tiers** (`subagent` para trabajo autónomo con tools, `intern` para delegación mecánica de texto — ver [MODELS.md](MODELS.md)):
+  - `lm_studio_generate` — texto/código sin herramientas, todo el contexto va en el prompt. Tier intern. Soporta `response_schema` (JSON Schema) para forzar salida estructurada.
+  - `lm_studio_agent` — el modelo local con acceso real a tus otros MCPs (`~/.lmstudio/mcp.json`), loop de agente completo. Tier subagent. Devuelve `tool_trace` (qué tool se llamó, con qué args, qué devolvió) para auditar cada dato de la respuesta, y soporta `response_schema` para forzar el formato final. Ver [`docs/audit-tasks-pattern.md`](docs/audit-tasks-pattern.md) para el patrón de uso en tareas de extracción/auditoría.
+  - `lm_studio_capacity` — techo de memoria del host, modelos residentes y margen libre. Llamalo **antes** de cargar un segundo modelo; con `candidate_model` te dice si ese modelo entra.
+  - `lm_studio_load_model` — carga un modelo concreto. Con `exclusive:true` (default) descarga los demás y mata de raíz el "modelo equivocado cargado"; con `exclusive:false` **suma** el modelo a los residentes para correr varios a la vez, verificando antes que entre en memoria.
+  - `lm_studio_list_models` — qué hay descargado/cargado en LM Studio, con el `tier=` y el contexto de cada uno.
   - `lm_studio_list_mcp_servers` — qué MCPs puede usar `lm_studio_agent`.
 - **`.claude/skills/intern/`** — Skill de Claude Code (`/intern`) con el protocolo completo.
 - **`templates/`** — snippets para pegar en tu `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md` y el `AGENTS.md` del `main` de OpenClaw (delegación automática, sin invocar el skill a mano), más `mcp.json` de ejemplo, el bloque MCP de OpenClaw y una plantilla de log de uso.
@@ -237,6 +238,7 @@ Variables de entorno opcionales (todas tienen default):
 |---|---|---|
 | `LM_STUDIO_BASE_URL` | `http://localhost:1234/v1` | Endpoint OpenAI-compatible de LM Studio |
 | `LM_STUDIO_DEFAULT_MODEL` | `qwen/qwen3.6-35b-a3b` | Modelo que se JIT-carga si no hay ninguno ya cargado |
+| `LM_STUDIO_SUBAGENT_MODELS` | `qwen3.8-27b-mlx` | Lista separada por comas de los modelos del tier **subagent** — los que se consideran aptos para `lm_studio_agent` (loop autónomo con tools). El resto queda en tier `intern`. Un valor vacío (`""`) desactiva el tier subagent. Es curado a propósito: el host reporta `tool_use` para todos los modelos no-embedding, así que esa capability no sirve para decidirlo |
 | `INTERN_ACTIVITY_LOG` | `~/.lmstudio/intern-activity.jsonl` | Log de actividad del intern (ver abajo). `off` lo desactiva |
 | `INTERN_MCP_CONFIG` | `~/.lmstudio/mcp.json` | Toolbox de `lm_studio_agent`. Apuntalo a un archivo curado para dar al intern un subconjunto acotado de MCPs (útil cuando lanza el bridge otro host, p.ej. OpenClaw) |
 

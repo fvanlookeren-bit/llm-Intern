@@ -86,6 +86,179 @@ const NATIVE_MODELS_URL = `${ORIGIN}/api/v0/models`;
 // dispare siempre ese preset, no un modelo al azar sin esa config.
 const DEFAULT_MODEL = process.env.LM_STUDIO_DEFAULT_MODEL ?? "qwen/qwen3.6-35b-a3b";
 
+// --- Tiers: "sub-agente junior" vs "intern" ---------------------------------
+//
+// Dos niveles de delegación, no uno:
+//
+//   - `subagent` (junior): modelo con contexto y capacidad suficientes para
+//     correr un loop de agente REAL con tools (lm_studio_agent) — leer archivos,
+//     consultar MCPs, decidir el próximo paso. Se le puede dar una tarea con
+//     cierta autonomía en vez de todo el contexto masticado en el prompt.
+//   - `intern`: delegación mecánica de texto/código (lm_studio_generate). Todo
+//     el contexto va en el prompt; no explora por su cuenta.
+//
+// **Por qué el tier es una lista curada y no se deriva de la API.** `/api/v0/models`
+// reporta `capabilities: ["tool_use"]` para TODOS los modelos no-embedding del
+// catálogo, incluido `lfm2.5-1.2b` (1.2B params). O sea la capability describe si
+// la arquitectura soporta tool-calling, no si el modelo es lo bastante bueno para
+// que se le confíe un loop autónomo. Ese juicio sale de la evidencia medida en
+// MODELS.md y `~/.claude/intern-usage-log.md`, no de una spec sheet — por eso vive
+// acá, versionado y revisable, en vez de auto-detectarse.
+//
+// Override por entorno (lista separada por comas). Sirve para otra máquina con
+// otro catálogo, sin tocar código: LM_STUDIO_SUBAGENT_MODELS="modelo-a,modelo-b".
+// Un valor vacío ("") desactiva el tier de sub-agente: todo pasa a ser intern.
+type ModelTier = "subagent" | "intern";
+
+const DEFAULT_SUBAGENT_MODELS = ["qwen3.8-27b-mlx"];
+
+function subagentRoster(): Set<string> {
+  const raw = process.env.LM_STUDIO_SUBAGENT_MODELS;
+  if (raw === undefined) return new Set(DEFAULT_SUBAGENT_MODELS);
+  return new Set(
+    raw
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+  );
+}
+
+function tierOf(modelId: string): ModelTier {
+  return subagentRoster().has(modelId) ? "subagent" : "intern";
+}
+
+// --- Capacidad de memoria: ¿entra otro modelo? -------------------------------
+//
+// Varios modelos a la vez SÍ se puede (es `exclusive:false` en lm_studio_load_model),
+// pero conviene mirar la memoria antes, porque el auto-fit de LM Studio no lo hace
+// por vos. Medido el 2026-08-16 en un M4 Pro de 48 GB con dos modelos residentes:
+//
+//   context_fit: family=qwen3_5 fitted=147,456 working_set=42.00GiB
+//     reserve=3.00GiB safe_ceiling=39.00GiB baseline=14.95GiB
+//     full_kv=65536B/token prompt_inputs=10240B/token attention=98304B/token
+//
+// Dos hallazgos que valen para cualquier máquina:
+//
+//  1. `working_set` sigue EXACTAMENTE a `iogpu.wired_limit_mb` (37.44 GiB con el
+//     default, 42.00 GiB tras `sysctl ...=43008`). O sea el techo lo pone el wired
+//     limit, no la RAM libre ni cuántos modelos haya cargados.
+//  2. El auto-fit dimensiona cada modelo **como si fuera el único**: le asignó a
+//     qwen los 39 GiB enteros del safe ceiling ignorando los ~15 GiB que gemma ya
+//     tenía residentes. Con dos modelos cargados eso sobre-compromete la memoria,
+//     y el síntoma es swap cuando ambos trabajan a la vez, no un error al cargar.
+//
+// Por eso este chequeo suma los PESOS residentes (dato duro de `lms ps --json`) y
+// los compara contra el techo. No intenta predecir el KV cache de cada arquitectura:
+// varía demasiado (qwen3_5 gasta 64 KiB/token de KV porque 16 de sus 64 capas son
+// full-attention; gemma4 usa ventana deslizante y su pico rotativo fue 0.59 GiB
+// para 226K de contexto). Predecirlo bien exigiría leer el config de cada modelo,
+// así que se reporta lo que se sabe con certeza y se avisa de lo que no.
+const GIB = 1024 ** 3;
+const CONTEXT_FIT_RESERVE_BYTES = 3 * GIB;
+
+// Fracción de la RAM total que macOS deja usar a la GPU cuando `iogpu.wired_limit_mb`
+// es 0 (default). Aproximación: en el M4 Pro de 48 GiB medido, LM Studio reportó
+// working_set=37.44GiB, que es 0.78 del total. Es una estimación, no un valor
+// documentado por Apple — cuando el wired limit está fijado explícitamente se usa
+// ese número y esta constante no interviene.
+const DEFAULT_WIRED_FRACTION = 0.78;
+
+interface MemoryBudget {
+  totalBytes: number;
+  budgetBytes: number;
+  explicitLimit: boolean;
+  source: string;
+}
+
+async function memoryBudget(): Promise<MemoryBudget> {
+  const totalBytes = os.totalmem();
+  let explicitLimit = false;
+  let budgetBytes = totalBytes * DEFAULT_WIRED_FRACTION;
+  let source = `estimado (${DEFAULT_WIRED_FRACTION} × RAM total; iogpu.wired_limit_mb=0)`;
+  try {
+    const { stdout } = await execFileAsync("/usr/sbin/sysctl", ["-n", "iogpu.wired_limit_mb"], {
+      timeout: 5000,
+    });
+    const mb = Number.parseInt(stdout.trim(), 10);
+    if (Number.isFinite(mb) && mb > 0) {
+      budgetBytes = mb * 1024 * 1024;
+      explicitLimit = true;
+      source = `iogpu.wired_limit_mb=${mb}`;
+    }
+  } catch {
+    // No es macOS, o no existe el sysctl: se queda con la estimación por fracción.
+  }
+  return { totalBytes, budgetBytes, explicitLimit, source };
+}
+
+interface LoadedDetail {
+  identifier: string;
+  sizeBytes: number;
+  contextLength?: number;
+  maxContextLength?: number;
+  parallel?: number;
+  status?: string;
+  remote: boolean;
+}
+
+// Igual que listLoadedInstances pero conservando los campos que hacen falta para
+// razonar sobre memoria. Se mantienen las dos porque listLoadedInstances es el
+// camino caliente de lm_studio_load_model y solo necesita identifier + remote.
+async function listLoadedDetails(lms: string): Promise<LoadedDetail[]> {
+  const remoteDevices = new Set<string>();
+  try {
+    const { stdout, stderr } = await execFileAsync(lms, ["link", "status"], { timeout: 15000 });
+    for (const m of `${stdout}\n${stderr}`.matchAll(/Identifier:\s*([0-9a-f]{8,})/gi)) {
+      remoteDevices.add(m[1]);
+    }
+  } catch {
+    // LM Link apagado: todo lo cargado se considera local.
+  }
+  try {
+    const { stdout } = await execFileAsync(lms, ["ps", "--json"], { timeout: 15000 });
+    const rows = JSON.parse(stdout) as Array<Record<string, unknown>>;
+    return rows
+      .filter((r) => typeof r.identifier === "string")
+      .map((r) => ({
+        identifier: r.identifier as string,
+        sizeBytes: typeof r.sizeBytes === "number" ? r.sizeBytes : 0,
+        contextLength: typeof r.contextLength === "number" ? r.contextLength : undefined,
+        maxContextLength: typeof r.maxContextLength === "number" ? r.maxContextLength : undefined,
+        parallel: typeof r.parallel === "number" ? r.parallel : undefined,
+        status: typeof r.status === "string" ? r.status : undefined,
+        remote: Boolean(
+          typeof r.deviceIdentifier === "string" && remoteDevices.has(r.deviceIdentifier)
+        ),
+      }));
+  } catch {
+    return [];
+  }
+}
+
+function gib(bytes: number): string {
+  return `${(bytes / GIB).toFixed(2)} GiB`;
+}
+
+// Tamaño en disco de CADA modelo del catálogo, cargado o no (`lms ls --json` trae
+// sizeBytes para todos). Es lo que permite decidir si otro modelo entra ANTES de
+// intentar cargarlo: /api/v0/models no expone el tamaño, y `lms ps --json` solo
+// conoce los que ya están residentes.
+async function catalogSizes(lms: string): Promise<Map<string, number>> {
+  const sizes = new Map<string, number>();
+  try {
+    const { stdout } = await execFileAsync(lms, ["ls", "--json"], { timeout: 20000 });
+    const rows = JSON.parse(stdout) as Array<Record<string, unknown>>;
+    for (const r of rows) {
+      const key = typeof r.modelKey === "string" ? r.modelKey : null;
+      if (key && typeof r.sizeBytes === "number") sizes.set(key, r.sizeBytes);
+    }
+  } catch {
+    // Sin CLI o formato distinto: quien llame debe tratar el Map vacío como
+    // "no sé el tamaño", nunca como "pesa cero".
+  }
+  return sizes;
+}
+
 // --- Log de actividad: una línea JSON por invocación del intern. ---
 //
 // Por qué existe: algunos hosts no muestran las tools MCP por su nombre. OpenClaw,
@@ -124,6 +297,8 @@ interface NativeModel {
   id: string;
   type?: string; // "llm" | "vlm" | "embeddings"
   state?: string; // "loaded" | "not-loaded"
+  max_context_length?: number;
+  loaded_context_length?: number;
 }
 
 async function fetchJson(url: string, init?: RequestInit) {
@@ -169,7 +344,15 @@ async function listNativeModels(): Promise<NativeModel[]> {
 // máquina, lo cual funciona pero cambia dónde se gasta la RAM/CPU; (2) validar
 // el 'model' explícito contra el catálogo sigue valiendo la pena para atajar
 // typos, pero "está en el catálogo" ya no implica "está descargado acá".
-async function resolveModel(model?: string): Promise<string> {
+//
+// Desambiguación por tier (2026-08): antes esto hacía `.find(state === "loaded")`,
+// o sea "el primero cargado". Con UN solo modelo residente daba igual, pero desde
+// que se soporta tener varios a la vez esa heurística elige en silencio y puede
+// mandar una tarea de agente al modelo chico, o una transformación mecánica al
+// grande y lento. Ahora `preferTier` resuelve el caso normal (generate → intern,
+// agent → subagent) y, si sigue habiendo ambigüedad DENTRO del tier, se lanza un
+// error que obliga a pasar 'model' explícito en vez de adivinar.
+async function resolveModel(model?: string, preferTier?: ModelTier): Promise<string> {
   const models = await listNativeModels();
   const localNonEmbedding = models.filter((m) => m.type !== "embeddings");
 
@@ -182,8 +365,31 @@ async function resolveModel(model?: string): Promise<string> {
     );
   }
 
-  const loaded = localNonEmbedding.find((m) => m.state === "loaded");
-  if (loaded) return loaded.id;
+  const loaded = localNonEmbedding.filter((m) => m.state === "loaded");
+
+  const pickFrom = (candidates: NativeModel[], scope: string): string | null => {
+    if (candidates.length === 1) return candidates[0].id;
+    if (candidates.length > 1) {
+      const listed = candidates.map((m) => `${m.id} (${tierOf(m.id)})`).join(", ");
+      throw new Error(
+        `Hay ${candidates.length} modelos cargados ${scope} y no se puede elegir sin adivinar: ${listed}. ` +
+          `Pasá el parámetro 'model' explícito, o dejá cargado uno solo de ese tier ` +
+          `(lm_studio_load_model con exclusive:true). Ver lm_studio_capacity para el estado actual.`
+      );
+    }
+    return null;
+  };
+
+  if (preferTier) {
+    const sameTier = loaded.filter((m) => tierOf(m.id) === preferTier);
+    const picked = pickFrom(sameTier, `del tier '${preferTier}'`);
+    if (picked) return picked;
+    // Ninguno del tier pedido: se cae al conjunto general (mejor usar lo que hay
+    // que fallar), pero manteniendo la regla anti-adivinanza.
+  }
+
+  const picked = pickFrom(loaded, "en memoria");
+  if (picked) return picked;
 
   // Nada cargado: preferir el default fijo (dispara JIT-load consistente con
   // su preset "mcps" ya aplicado) antes que "el primero del catálogo" al azar.
@@ -267,7 +473,10 @@ server.registerTool(
     title: "Listar modelos de LM Studio",
     description:
       "Lista los modelos del servidor local de LM Studio (http://localhost:1234) e indica cuáles están " +
-      "actualmente cargados en memoria (state: loaded) vs solo disponibles para JIT-load.",
+      "actualmente cargados en memoria (state: loaded) vs solo disponibles para JIT-load, y en qué TIER " +
+      "está cada uno: 'subagent' (junior, apto para lm_studio_agent con tools y autonomía) o 'intern' " +
+      "(delegación mecánica de texto vía lm_studio_generate). El tier es una lista curada, no una " +
+      "capability de la API — ver la nota en el código sobre por qué.",
     inputSchema: {},
   },
   async () => {
@@ -275,9 +484,125 @@ server.registerTool(
     if (!models.length) {
       return { content: [{ type: "text", text: "No hay modelos en LM Studio." }] };
     }
-    const lines = models.map(
-      (m) => `${m.id} [${m.state === "loaded" ? "cargado" : "no cargado"}]${m.type ? ` (${m.type})` : ""}`
+    const lines = models.map((m) => {
+      const state = m.state === "loaded" ? "cargado" : "no cargado";
+      const tier = m.type === "embeddings" ? "—" : tierOf(m.id);
+      const ctx =
+        m.state === "loaded" && m.loaded_context_length
+          ? ` ctx=${m.loaded_context_length.toLocaleString("es")}/${(m.max_context_length ?? 0).toLocaleString("es")}`
+          : m.max_context_length
+            ? ` ctx_max=${m.max_context_length.toLocaleString("es")}`
+            : "";
+      return `${m.id} [${state}] tier=${tier}${m.type ? ` (${m.type})` : ""}${ctx}`;
+    });
+    return {
+      content: [
+        {
+          type: "text",
+          text:
+            `${lines.join("\n")}\n\n` +
+            `tier=subagent → usar con lm_studio_agent (tools, contexto largo, autonomía).\n` +
+            `tier=intern   → usar con lm_studio_generate (todo el contexto en el prompt).\n` +
+            `Override: LM_STUDIO_SUBAGENT_MODELS="id-a,id-b". Memoria: lm_studio_capacity.`,
+        },
+      ],
+    };
+  }
+);
+
+server.registerTool(
+  "lm_studio_capacity",
+  {
+    title: "Memoria disponible: ¿entra otro modelo a la vez?",
+    description:
+      "Reporta el techo de memoria del host, qué modelos están residentes y cuánto margen queda, para " +
+      "decidir si conviene cargar OTRO modelo en paralelo (varios sub-agentes a la vez) o si hay que " +
+      "liberar antes. Llamar esto ANTES de un lm_studio_load_model con exclusive:false. " +
+      "Importante: el auto-fit de LM Studio dimensiona cada modelo como si fuera el único que hay, así " +
+      "que no te protege del sobre-compromiso — este chequeo existe justamente para eso. Solo mira PESOS " +
+      "residentes (dato duro); el KV cache depende de la arquitectura y del contexto y no se predice acá.",
+    inputSchema: {
+      candidate_model: z
+        .string()
+        .optional()
+        .describe(
+          "ID de un modelo que estás pensando cargar además de los actuales. Si se pasa, se compara su " +
+            "tamaño en disco contra el margen libre y se devuelve un veredicto."
+        ),
+    },
+  },
+  async ({ candidate_model }) => {
+    const lms = resolveLmsBinary();
+    const [budget, loaded] = await Promise.all([memoryBudget(), listLoadedDetails(lms)]);
+
+    const local = loaded.filter((i) => !i.remote);
+    const remote = loaded.filter((i) => i.remote);
+    const residentBytes = local.reduce((sum, i) => sum + i.sizeBytes, 0);
+    const ceiling = budget.budgetBytes - CONTEXT_FIT_RESERVE_BYTES;
+    const headroom = ceiling - residentBytes;
+
+    const lines: string[] = [];
+    lines.push(`RAM total: ${gib(budget.totalBytes)}`);
+    lines.push(`Techo de memoria del host: ${gib(budget.budgetBytes)}  [${budget.source}]`);
+    lines.push(`Reserva del auto-fit: ${gib(CONTEXT_FIT_RESERVE_BYTES)} → safe ceiling ${gib(ceiling)}`);
+    lines.push("");
+
+    if (!local.length) {
+      lines.push("Modelos residentes en esta máquina: ninguno.");
+    } else {
+      lines.push(`Modelos residentes en esta máquina (${local.length}):`);
+      for (const i of local) {
+        const ctx = i.contextLength ? `ctx=${i.contextLength.toLocaleString("es")}` : "ctx=?";
+        const par = i.parallel ? ` parallel=${i.parallel}` : "";
+        const st = i.status ? ` ${i.status}` : "";
+        lines.push(`  - ${i.identifier}  ${gib(i.sizeBytes)}  ${ctx}${par}  tier=${tierOf(i.identifier)}${st}`);
+      }
+    }
+    if (remote.length) {
+      lines.push(
+        `Instancias en otros equipos (LM Link, no cuentan para esta memoria): ${remote
+          .map((i) => i.identifier)
+          .join(", ")}`
+      );
+    }
+
+    lines.push("");
+    lines.push(`Pesos residentes: ${gib(residentBytes)}`);
+    lines.push(`Margen libre (solo pesos): ${gib(headroom)}`);
+    lines.push(
+      "Ojo: el margen NO descuenta el KV cache, que crece con el contexto y depende de la arquitectura " +
+        "(p.ej. qwen3_5 gasta ~64 KiB/token porque 16 de sus 64 capas son full-attention; gemma4 usa " +
+        "ventana deslizante y gasta muchísimo menos). Dejá holgura real, no cargues hasta el borde."
     );
+
+    if (candidate_model) {
+      lines.push("");
+      if (local.some((i) => i.identifier === candidate_model)) {
+        lines.push(`'${candidate_model}' YA está residente en esta máquina.`);
+      } else {
+        const sizes = await catalogSizes(lms);
+        const size = sizes.get(candidate_model);
+        if (size === undefined) {
+          lines.push(
+            `No pude leer el tamaño de '${candidate_model}' (¿ID mal escrito, o el CLI 'lms' no responde?). ` +
+              `Verificá el ID con lm_studio_list_models.`
+          );
+        } else {
+          const fits = size < headroom;
+          lines.push(
+            `Candidato '${candidate_model}' (tier=${tierOf(candidate_model)}): pesa ${gib(size)} contra ` +
+              `${gib(headroom)} de margen → ${fits ? "ENTRA" : "NO ENTRA"} solo por pesos.`
+          );
+          if (fits) {
+            lines.push(
+              `Quedarían ${gib(headroom - size)} para el KV cache de TODOS los modelos residentes. ` +
+                `Si eso es menos de ~4 GiB, esperá contextos cortos o swap.`
+            );
+          }
+        }
+      }
+    }
+
     return { content: [{ type: "text", text: lines.join("\n") }] };
   }
 );
@@ -294,6 +619,9 @@ server.registerTool(
       "lm_studio_agent no toman por error un modelo que quedó cargado de otra sesión. " +
       "**Seguro con LM Link:** si hay instancias cargadas en OTROS equipos, no se tocan (un `unload --all` " +
       "las apagaría y podría tumbar el modelo del que depende un agente allá). " +
+      "**Varios modelos a la vez:** con exclusive:false se suma este modelo a los ya residentes (p.ej. un " +
+      "sub-agente grande + un intern chico, cada uno atendiendo lo suyo). Antes de cargar se verifica que " +
+      "entre en memoria y se aborta con números si no — usá lm_studio_capacity para verlo de antemano. " +
       "Requiere el CLI `lms` (lo instalan tanto LM Studio como Bionic; se busca en LMS_PATH, " +
       "~/.lmstudio/bin/lms, el bundle de la app, o el PATH). Devuelve `lms ps` al terminar.",
     inputSchema: {
@@ -325,10 +653,32 @@ server.registerTool(
         .int()
         .positive()
         .optional()
-        .describe("Longitud de contexto a usar al cargar. Omitir = default del modelo."),
+        .describe(
+          "Longitud de contexto a usar al cargar. Omitir = default del modelo. OJO: LM Studio hace " +
+            "auto-fit y RECORTA este valor en silencio si no entra en memoria (sin error) — verificá el " +
+            "contexto real en la salida de `lms ps` que devuelve esta tool, no asumas que se aplicó."
+        ),
+      parallel: z
+        .number()
+        .int()
+        .positive()
+        .max(16)
+        .optional()
+        .describe(
+          "Predicciones concurrentes que admite el modelo. Para un sub-agente que trabaja de a una tarea, " +
+            "usá 1: cada slot extra reserva memoria y recorta el contexto disponible."
+        ),
+      force: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe(
+          "Solo aplica con exclusive:false. Salta el chequeo de memoria que impide cargar un modelo que no " +
+            "entra junto a los residentes. Usar solo si sabés que el margen alcanza."
+        ),
     },
   },
-  async ({ model, exclusive, include_remote, ttl, context_length }) => {
+  async ({ model, exclusive, include_remote, ttl, context_length, parallel, force }) => {
     // Validar el ID contra el catálogo local antes de invocar lms (mismo criterio
     // que resolveModel para un 'model' explícito) — evita un lms load que falle o,
     // peor, matchee parcialmente otro modelo.
@@ -350,6 +700,49 @@ server.registerTool(
     const lms = resolveLmsBinary();
     const steps: string[] = [];
     try {
+      // Multi-modelo (exclusive:false): antes de sumar otro residente, verificar
+      // que entre. El auto-fit de LM Studio NO hace esta cuenta — dimensiona cada
+      // modelo como si fuera el único, así que sin este gate el sobre-compromiso
+      // no da error al cargar, da swap después, cuando dos modelos trabajan a la
+      // vez y ya es difícil de atribuir.
+      if (!exclusive && !force) {
+        const [budget, loadedNow, sizes] = await Promise.all([
+          memoryBudget(),
+          listLoadedDetails(lms),
+          catalogSizes(lms),
+        ]);
+        const localNow = loadedNow.filter((i) => !i.remote);
+        const alreadyResident = localNow.some((i) => i.identifier === model);
+        const residentBytes = localNow.reduce((sum, i) => sum + i.sizeBytes, 0);
+        const headroom = budget.budgetBytes - CONTEXT_FIT_RESERVE_BYTES - residentBytes;
+        const size = sizes.get(model);
+        if (!alreadyResident && size !== undefined && size >= headroom) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `No cargo '${model}' junto a los residentes: pesa ${gib(size)} y solo quedan ` +
+                  `${gib(headroom)} de margen.\n\n` +
+                  `Techo: ${gib(budget.budgetBytes)} [${budget.source}] − ${gib(CONTEXT_FIT_RESERVE_BYTES)} ` +
+                  `de reserva − ${gib(residentBytes)} de pesos residentes (${localNow
+                    .map((i) => i.identifier)
+                    .join(", ")}).\n\n` +
+                  `Opciones: exclusive:true para descargar los otros primero; subir el techo con ` +
+                  `\`sudo sysctl iogpu.wired_limit_mb=<MB>\`; o force:true si sabés lo que hacés. ` +
+                  `Ver lm_studio_capacity para el detalle.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        if (size !== undefined && !alreadyResident) {
+          steps.push(
+            `Chequeo de memoria OK: ${gib(size)} contra ${gib(headroom)} de margen ` +
+              `(quedarán ${gib(headroom - size)} para KV cache).`
+          );
+        }
+      }
       if (exclusive) {
         // NO usar `unload --all`: con LM Link, `lms ps` incluye instancias
         // cargadas en OTRAS máquinas, y un unload masivo las apagaría — puede
@@ -377,9 +770,19 @@ server.registerTool(
       const loadArgs = ["load", model, "-y"];
       if (ttl !== undefined) loadArgs.push("--ttl", String(ttl));
       if (context_length !== undefined) loadArgs.push("--context-length", String(context_length));
+      if (parallel !== undefined) loadArgs.push("--parallel", String(parallel));
       await execFileAsync(lms, loadArgs, { timeout: 300000 });
-      steps.push(`Cargado '${model}'.`);
-      logActivity({ tool: "lm_studio_load_model", model, exclusive, include_remote, ok: true });
+      steps.push(`Cargado '${model}' (tier=${tierOf(model)}).`);
+      logActivity({
+        tool: "lm_studio_load_model",
+        model,
+        tier: tierOf(model),
+        exclusive,
+        include_remote,
+        context_length,
+        parallel,
+        ok: true,
+      });
 
       const { stdout: ps } = await execFileAsync(lms, ["ps"]);
       return { content: [{ type: "text", text: `${steps.join("\n")}\n\nEstado actual (lms ps):\n${ps.trim()}` }] };
@@ -471,7 +874,10 @@ server.registerTool(
       ...(system ? [{ role: "system", content: system }] : []),
       { role: "user", content: prompt },
     ];
-    const resolvedModel = await resolveModel(model);
+    // Tier 'intern': esto es delegación mecánica de texto. Si además del modelo
+    // grande hay uno chico residente, se prefiere el chico — no tiene sentido
+    // ocupar al sub-agente (lento) en una transformación 1-a-1.
+    const resolvedModel = await resolveModel(model, "intern");
     const data = (await lmFetch("/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -694,7 +1100,19 @@ server.registerTool(
         ...(system ? [{ role: "system", content: system }] : []),
         { role: "user", content: prompt },
       ];
-      const resolvedModel = await resolveModel(model);
+      // Tier 'subagent': un loop de agente con tools necesita el modelo con más
+      // capacidad y contexto residente, no el primero que esté cargado. Si el
+      // elegido resulta ser de tier 'intern' no se falla — puede ser deliberado —
+      // pero se avisa en la respuesta, porque los modos de falla del tool-calling
+      // con un modelo chico (inventar tools, no parar nunca) son difíciles de
+      // diagnosticar desde el resultado.
+      const resolvedModel = await resolveModel(model, "subagent");
+      const tierWarning =
+        tierOf(resolvedModel) === "subagent"
+          ? null
+          : `Aviso: '${resolvedModel}' está en el tier 'intern', no 'subagent'. Un loop de agente con tools ` +
+            `en un modelo chico tiende a inventar tools o a no parar. Si fue a propósito, ignorá esto; si no, ` +
+            `cargá un modelo de tier subagent (lm_studio_list_models) o pasá 'model' explícito.`;
 
       // Registro de auditoría: qué tool se llamó, con qué args, y qué devolvió
       // (truncado). Se devuelve siempre junto al texto final — el modelo local
@@ -935,6 +1353,7 @@ server.registerTool(
         final_text: finalText.trim(),
         structured,
         ...(structuredError ? { structured_error: structuredError } : {}),
+        ...(tierWarning ? { tier_warning: tierWarning } : {}),
         tool_trace: toolTrace,
       };
       return { content: [{ type: "text", text: JSON.stringify(envelope, null, 2) }] };
