@@ -127,6 +127,44 @@ function tierOf(modelId: string): ModelTier {
   return subagentRoster().has(modelId) ? "subagent" : "intern";
 }
 
+// --- Auto-unload por TTL -----------------------------------------------------
+//
+// Un modelo residente ocupa su memoria aunque nadie lo use, y en esta máquina eso
+// se acumula: basta que dos queden cargados para sobre-comprometer el techo (ver
+// la nota de capacidad más abajo). Como el host recarga rápido (~11-20s para un 27B
+// en MLX), conviene soltar la memoria cuando el trabajo termina en vez de retenerla
+// "por si acaso".
+//
+// El mecanismo es el TTL del host: descarga el modelo tras N segundos sin usarlo.
+// Verificado el 2026-08-16: `/v1/chat/completions` acepta un campo `ttl` en el body
+// y lo aplica al modelo que JIT-carga esa misma request (se comprobó viendo el TTL
+// en `lms ps` tras una llamada a un modelo que no estaba cargado). Por eso el bridge
+// lo manda en cada request: cualquier modelo que levante por su cuenta queda con
+// auto-unload, sin que nadie tenga que acordarse de descargarlo.
+//
+// Es un TTL de INACTIVIDAD, no un timer fijo: cada request lo reinicia, así que una
+// tanda de llamadas seguidas no paga recargas — solo se libera cuando Claude
+// realmente dejó de usar el intern.
+//
+// Límite conocido: el TTL se fija al CARGAR. Si el modelo ya estaba residente sin
+// TTL (cargado a mano, desde la GUI, o por LM Link desde otro equipo), mandarlo en
+// la request no se lo agrega retroactivamente — hay que recargarlo con
+// lm_studio_load_model. Es justamente el caso de los modelos que aparecen solos.
+//
+// 0 desactiva el auto-unload (comportamiento viejo: el modelo queda hasta que algo
+// lo descargue).
+const DEFAULT_TTL_SECONDS = (() => {
+  const raw = process.env.LM_STUDIO_TTL_SECONDS;
+  if (raw === undefined) return 600;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 600;
+})();
+
+// Campo `ttl` para el body de una request de chat, o nada si está desactivado.
+function ttlField(): Record<string, number> {
+  return DEFAULT_TTL_SECONDS > 0 ? { ttl: DEFAULT_TTL_SECONDS } : {};
+}
+
 // --- Capacidad de memoria: ¿entra otro modelo? -------------------------------
 //
 // Varios modelos a la vez SÍ se puede (es `exclusive:false` en lm_studio_load_model),
@@ -198,6 +236,7 @@ interface LoadedDetail {
   maxContextLength?: number;
   parallel?: number;
   status?: string;
+  ttlMs?: number | null;
   remote: boolean;
 }
 
@@ -226,6 +265,7 @@ async function listLoadedDetails(lms: string): Promise<LoadedDetail[]> {
         maxContextLength: typeof r.maxContextLength === "number" ? r.maxContextLength : undefined,
         parallel: typeof r.parallel === "number" ? r.parallel : undefined,
         status: typeof r.status === "string" ? r.status : undefined,
+        ttlMs: typeof r.ttlMs === "number" ? r.ttlMs : null,
         remote: Boolean(
           typeof r.deviceIdentifier === "string" && remoteDevices.has(r.deviceIdentifier)
         ),
@@ -555,7 +595,18 @@ server.registerTool(
         const ctx = i.contextLength ? `ctx=${i.contextLength.toLocaleString("es")}` : "ctx=?";
         const par = i.parallel ? ` parallel=${i.parallel}` : "";
         const st = i.status ? ` ${i.status}` : "";
-        lines.push(`  - ${i.identifier}  ${gib(i.sizeBytes)}  ${ctx}${par}  tier=${tierOf(i.identifier)}${st}`);
+        const ttl = i.ttlMs ? ` ttl=${Math.round(i.ttlMs / 60000)}m` : " SIN TTL";
+        lines.push(
+          `  - ${i.identifier}  ${gib(i.sizeBytes)}  ${ctx}${par}  tier=${tierOf(i.identifier)}${st}${ttl}`
+        );
+      }
+      const noTtl = local.filter((i) => !i.ttlMs);
+      if (noTtl.length && DEFAULT_TTL_SECONDS > 0) {
+        lines.push(
+          `  ⚠ ${noTtl.length} sin TTL (${noTtl.map((i) => i.identifier).join(", ")}): retienen su memoria ` +
+            `hasta que algo los descargue. El TTL se fija al cargar, así que mandarlo en las requests no se ` +
+            `lo agrega retroactivamente — recargalos con lm_studio_load_model para que se auto-descarguen.`
+        );
       }
     }
     if (remote.length) {
@@ -645,9 +696,12 @@ server.registerTool(
       ttl: z
         .number()
         .int()
-        .positive()
+        .min(0)
         .optional()
-        .describe("Segundos de inactividad tras los cuales el host descarga el modelo (auto-unload). Omitir = sin TTL."),
+        .describe(
+          "Segundos de inactividad tras los cuales el host descarga el modelo (auto-unload). Omitir = usar " +
+            "el default del bridge (LM_STUDIO_TTL_SECONDS, 600s). Pasar 0 para dejarlo residente sin TTL."
+        ),
       context_length: z
         .number()
         .int()
@@ -768,7 +822,13 @@ server.registerTool(
         }
       }
       const loadArgs = ["load", model, "-y"];
-      if (ttl !== undefined) loadArgs.push("--ttl", String(ttl));
+      // Sin `ttl` explícito se aplica el default del bridge, para que un modelo
+      // cargado por acá también se auto-descargue al quedar ocioso. `ttl: 0`
+      // explícito significa "quiero que quede residente" y desactiva el auto-unload.
+      const effectiveTtl = ttl ?? (DEFAULT_TTL_SECONDS > 0 ? DEFAULT_TTL_SECONDS : undefined);
+      if (effectiveTtl !== undefined && effectiveTtl > 0) {
+        loadArgs.push("--ttl", String(effectiveTtl));
+      }
       if (context_length !== undefined) loadArgs.push("--context-length", String(context_length));
       if (parallel !== undefined) loadArgs.push("--parallel", String(parallel));
       await execFileAsync(lms, loadArgs, { timeout: 300000 });
@@ -883,6 +943,7 @@ server.registerTool(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         model: resolvedModel,
+        ...ttlField(),
         messages,
         temperature,
         max_tokens,
@@ -1146,6 +1207,7 @@ server.registerTool(
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             model: resolvedModel,
+            ...ttlField(),
             messages,
             tools: openAiTools,
             tool_choice: "auto",
@@ -1322,6 +1384,7 @@ server.registerTool(
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               model: resolvedModel,
+              ...ttlField(),
               messages: structuringMessages,
               temperature: 0,
               max_tokens,

@@ -239,6 +239,7 @@ Variables de entorno opcionales (todas tienen default):
 | `LM_STUDIO_BASE_URL` | `http://localhost:1234/v1` | Endpoint OpenAI-compatible de LM Studio |
 | `LM_STUDIO_DEFAULT_MODEL` | `qwen/qwen3.6-35b-a3b` | Modelo que se JIT-carga si no hay ninguno ya cargado |
 | `LM_STUDIO_SUBAGENT_MODELS` | `qwen3.8-27b-mlx` | Lista separada por comas de los modelos del tier **subagent** — los que se consideran aptos para `lm_studio_agent` (loop autónomo con tools). El resto queda en tier `intern`. Un valor vacío (`""`) desactiva el tier subagent. Es curado a propósito: el host reporta `tool_use` para todos los modelos no-embedding, así que esa capability no sirve para decidirlo |
+| `LM_STUDIO_TTL_SECONDS` | `600` | **Auto-unload.** Segundos de inactividad tras los cuales el host descarga un modelo que levantó el bridge. Se manda en cada request, así que todo modelo que el bridge JIT-cargue queda con auto-descarga sin que nadie se acuerde de liberarlo. Es un TTL de inactividad (cada request lo reinicia), así que una tanda seguida no paga recargas. `0` lo desactiva |
 | `INTERN_ACTIVITY_LOG` | `~/.lmstudio/intern-activity.jsonl` | Log de actividad del intern (ver abajo). `off` lo desactiva |
 | `INTERN_MCP_CONFIG` | `~/.lmstudio/mcp.json` | Toolbox de `lm_studio_agent`. Apuntalo a un archivo curado para dar al intern un subconjunto acotado de MCPs (útil cuando lanza el bridge otro host, p.ej. OpenClaw) |
 

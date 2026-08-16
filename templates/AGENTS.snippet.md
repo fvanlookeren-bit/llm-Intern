@@ -82,6 +82,14 @@ sobre-compromiso no da error al cargar — da swap después. Y ojo: el host pued
 **recortar en silencio** el `context_length` que pidas; verificá el valor real en la
 salida de `lms ps`, no asumas que se aplicó.
 
+**Auto-unload:** el bridge manda un `ttl` en cada request
+(`LM_STUDIO_TTL_SECONDS`, default 600s), así que todo modelo que él levante se
+descarga solo al quedar ocioso. Es de inactividad — cada llamada reinicia el contador,
+o sea una tanda seguida no paga recargas. La regla es **cargar otro modelo solo cuando
+hace falta**, no dejar varios residentes por comodidad. No cubre modelos ya residentes
+sin TTL (cargados a mano o desde otro equipo): el TTL se fija al cargar, no
+retroactivamente; `lm_studio_capacity` los marca `SIN TTL`.
+
 **5. Umbral de descarte:** si verificar/corregir el output del intern después cuesta
 más del 70% de lo que hubiera costado hacer la tarea directo (`v > 0.70`), descartar
 el intern para ese tipo de tarea — después de probar otro modelo (punto 3). El punto

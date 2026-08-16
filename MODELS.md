@@ -67,6 +67,25 @@ Para una tanda con un modelo específico y cero ambigüedad, sigue sirviendo
 memoria, los pesos residentes y el margen libre; `lm_studio_load_model` con
 `exclusive:false` hace el mismo chequeo y aborta con números si no entra.
 
+### Auto-unload: no retengas memoria que no estás usando
+
+El bridge manda un `ttl` en cada request (`LM_STUDIO_TTL_SECONDS`, default 600s), y el
+host lo aplica al modelo que JIT-carga esa misma request. O sea: **todo modelo que
+levante el bridge se auto-descarga al quedar ocioso**, sin que nadie tenga que
+acordarse. Es un TTL de *inactividad* — cada request lo reinicia, así que una tanda de
+llamadas seguidas no paga recargas, y la memoria se libera recién cuando el trabajo
+terminó de verdad. Recargar un 27B en MLX cuesta ~11-20s, mucho menos que tener 15 GiB
+retenidos "por si acaso".
+
+Con esto la regla pasa a ser **cargar un modelo más solo cuando hace falta**, en vez de
+dejar varios residentes por comodidad.
+
+**Límite importante:** el TTL se fija al **cargar**. Un modelo que ya estaba residente
+sin TTL — cargado a mano, desde la GUI, o por LM Link desde otro equipo — no lo recibe
+retroactivamente por mandarlo en la request; hay que recargarlo. `lm_studio_capacity`
+marca con `SIN TTL` a los que están en esa situación, que son justamente los que
+aparecen solos y acumulan memoria.
+
 ### Por qué el chequeo es necesario (medido, M4 Pro 48 GB, 2026-08-16)
 
 El auto-fit del host dimensiona cada modelo **como si fuera el único**. Con dos
